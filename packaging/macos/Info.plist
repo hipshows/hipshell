@@ -8,8 +8,8 @@
     <key>CFBundleExecutable</key><string>hipssh</string>
     <key>CFBundleIconFile</key><string>HiPShell.icns</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>1.3</string>
-    <key>CFBundleVersion</key><string>4</string>
+    <key>CFBundleShortVersionString</key><string>1.5</string>
+    <key>CFBundleVersion</key><string>5</string>
     <key>CFBundleDevelopmentRegion</key><string>zh-Hans</string>
     <key>CFBundleLocalizations</key><array><string>zh-Hans</string></array>
     <key>LSMinimumSystemVersion</key><string>11.0</string>

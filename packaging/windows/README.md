@@ -51,8 +51,8 @@ cargo build --release --locked
 
 ## 编译后检查
 
-1. 资源管理器中 `hipssh.exe` 显示 HiPShell 图标; 右键 → 属性 → 详细信息, 产品名 HiPShell, 版本 1.3.0, 版权 HiPsHoW.
-2. 双击运行, 窗口标题为 `HiPShell Ver.1.3`, exe 旁出现 `config\` 文件夹.
+1. 资源管理器中 `hipssh.exe` 显示 HiPShell 图标; 右键 → 属性 → 详细信息, 产品名 HiPShell, 版本 1.5.0, 版权 HiPsHoW.
+2. 双击运行, 窗口标题为 `HiPShell Ver.1.5`, exe 旁出现 `config\` 文件夹.
 3. 连接服务器后上传一个远端已存在的同名文件, 弹出的确认框按钮应为 "覆盖 / 保留两者 / 取消".
 4. 在终端中粘贴多行文本, 每行只执行一次, 不出现多余的空回车.
 5. 标签、状态栏、按钮文字清晰; 最大化后最小化再恢复, 界面完整显示.

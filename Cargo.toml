@@ -1,6 +1,6 @@
 [package]
 name = "hipssh"
-version = "1.3.0"
+version = "1.5.0"
 authors = ["HiPsHoW"]
 edition = "2024"
 description = "GUI 与 MCP 共用后台的轻量 SSH 客户端"
@@ -17,13 +17,13 @@ cbc = { version = "0.1", features = ["alloc", "block-padding"] }
 des = "0.8"
 md5 = "0.7"
 rand = "0.8"
-russh = { version = "0.64.1", default-features = false, features = ["ring", "rsa"] }
+russh = { version = "0.65.1", default-features = false, features = ["ring", "rsa"] }
 russh-sftp = "3.0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "io-util", "time", "fs", "signal"] }
 uuid = { version = "1", features = ["v4", "serde"] }
-vt100 = "0.16"
+vt100 = "0.18"
 unicode-width = "0.2"
 zeroize = "1"
 slint = { version = "=1.18.1", optional = true, default-features = false, features = ["std", "backend-winit", "renderer-software", "compat-1-2", "accessibility", "unstable-winit-030", "unstable-fontique-011"] }

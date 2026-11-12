@@ -524,7 +524,7 @@ fn definitions() -> Vec<Value> {
         ),
         tool(
             "write_terminal",
-            "[终端] 向用户看到的终端输入, 用户实时可见. 依次发送 key、data、enter: data 只写普通文字 (不要写 \\r 等转义), 执行命令用 enter: true; 控制键用 key, 如 ctrl_c 中断、clear_line 清空当前输入行. 输出需要时间, 写入后用 read_terminal 查看. 用户正在输入时会被拒绝, 稍后重试.",
+            "[终端] 向用户看到的终端输入, 用户实时可见. 依次发送 key、data、enter: data 只写普通文字 (不要写 \\r 等转义), 执行命令用 enter: true; 控制键用 key, 如 ctrl_c 中断、clear_line 清空当前输入行. 输出需要时间, 写入后用 read_terminal 查看. 用户正在输入时会被拒绝, 稍后重试. 返回 queued 表示已进入发送队列, 期间用户接管或授权撤销时剩余部分不再发送.",
             with_session(json!({
                 "data":{"type":"string","maxLength":16384,"description":"要输入的文字, 原样发送"},
                 "enter":{"type":"boolean","default":false,"description":"最后按回车"},
@@ -534,7 +534,7 @@ fn definitions() -> Vec<Value> {
         ),
         tool(
             "input_admin_password",
-            "[终端] 终端停在密码提示 (如 sudo 的 \"[sudo] password for 用户:\"、su 的 \"Password:\") 时, 输入用户为该连接设置的管理员密码并回车. 密码由 HiPShell 直接填写, 你看不到也不要提供. 先用 read_terminal 确认 cursor_line 是密码提示; 未设置密码、不在提示处或刚输入过会被拒绝, 此时告诉用户自行输入, 不要反复调用.",
+            "[终端] 终端停在密码提示 (如 sudo 的 \"[sudo] password for 用户:\"、su 的 \"Password:\") 时, 输入用户为该连接设置的管理员密码并回车. 密码由 HiPShell 直接填写, 你看不到也不要提供. 先用 read_terminal 确认 cursor_line 是密码提示; 未设置密码、不在提示处或刚输入过会被拒绝, 此时告诉用户自行输入, 不要反复调用. 返回 queued 表示已排队: 真正发送前提示若已消失则不发送, 之后用 read_terminal 确认结果.",
             with_session(json!({})),
             &["session_id"],
         ),

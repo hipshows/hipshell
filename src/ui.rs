@@ -46,6 +46,27 @@ thread_local! {
     // 已见过的传输任务 (新出现的用户任务自动打开传输面板) 与面板中已清除的任务.
     static TRANSFER_SEEN: RefCell<std::collections::HashSet<String>> = RefCell::default();
     static TRANSFER_CLEARED: RefCell<std::collections::HashSet<String>> = RefCell::default();
+    // 认证弹窗当前对应的后台请求标识, 提交回答时带回核对.
+    static AUTH_REQUEST: RefCell<String> = RefCell::default();
+    // 各会话当前所展示文件列表所属连接的代次: 对列表中的文件发起操作时带上, 后台据此拒绝已重连标签上的旧操作.
+    static LISTED_LINK: RefCell<HashMap<String, u64>> = RefCell::default();
+}
+
+// 关闭某会话上打开的文件弹窗 (改权限、改名、新建、删除). 会话换成新连接后由调用方关闭: 新代次记下之前确认的操作
+// 带着旧代次, 后台会拒绝; 之后才确认的只可能来自新列表上打开的弹窗.
+fn close_file_dialogs(c_ui: &AppWindow, c_session: &str) {
+    if c_ui.get_permissions_session().as_str() == c_session { c_ui.set_permissions_editing(false); }
+    if c_ui.get_rename_session().as_str() == c_session { c_ui.set_rename_editing(false); }
+    if c_ui.get_create_session().as_str() == c_session { c_ui.set_create_editing(false); }
+    if c_ui.get_delete_session().as_str() == c_session { c_ui.set_delete_editing(false); }
+}
+// 为针对文件列表的操作带上列表所属连接的代次 (见 LISTED_LINK); 只能在界面线程调用.
+fn attach_listed_link(c_args: &mut Value) {
+    if c_args.get("_link").is_none()
+        && let Some(l_link) = LISTED_LINK.with_borrow(|c| c.get(string(c_args, "session_id")).copied())
+    {
+        c_args["_link"] = json!(l_link);
+    }
 }
 
 pub(crate) fn invalidate_file_cache(c_ui: &AppWindow, c_session: &str) {
@@ -480,11 +501,14 @@ pub fn run(
             .take(MAX_TRANSFER_ITEMS + 1)
             .map(std::path::Path::to_path_buf)
             .collect::<Vec<_>>();
+        let z_session = z_ui.get_active_session().to_string();
+        let z_link = LISTED_LINK.with_borrow(|c| c.get(&z_session).copied());
         upload_paths(
             &z_runtime,
             &z_backend,
             z_weak.clone(),
-            z_ui.get_active_session().to_string(),
+            z_session,
+            z_link,
             z_ui.get_browse_path().to_string(),
             z_paths,
         );
@@ -875,7 +899,12 @@ pub fn run(
             z_ui.set_tree_scroll_y(0.0);
             return;
         }
-        if c_method == "invalidate_files" || c_method == "discard_files" { z_views.borrow_mut().invalidate_files(&z_ui, &z_arg, c_method == "discard_files"); return; }
+        if c_method == "invalidate_files" || c_method == "discard_files" {
+            // 会话已换成新连接: 针对旧列表打开的文件弹窗一并关闭, 不能在新连接上确认.
+            if c_method == "discard_files" { close_file_dialogs(&z_ui, &z_arg); }
+            z_views.borrow_mut().invalidate_files(&z_ui, &z_arg, c_method == "discard_files");
+            return;
+        }
         if c_method == "select_command_group" {
             z_ui.set_selected_command_group(z_arg.into());
             z_ui.set_saved_command_id("".into());
@@ -942,13 +971,15 @@ pub fn run(
             "remove_connection" => ("remove_connection", json!({"connection_id":z_arg})),
             "focus_session" => ("focus_session",json!({"session_id":z_arg})),
             "disconnect" => ("disconnect",json!({"session_id":z_arg})),
-            "trust_once" | "trust_permanent" | "trust_reject" => ("trust_host",json!({"session_id":z_arg,"decision":match c_method.as_str(){"trust_once"=>"once","trust_permanent"=>"permanent",_=>"reject"}})),
+            // 带上界面展示的指纹和提示, 后台核对后才采用, 弹窗期间连接已更换时不会误用到新连接.
+            "trust_once" | "trust_permanent" | "trust_reject" => ("trust_host",json!({"session_id":z_arg,"fingerprint":z_ui.get_trust_fingerprint().as_str(),"decision":match c_method.as_str(){"trust_once"=>"once","trust_permanent"=>"permanent",_=>"reject"}})),
             "answer_auth" => {
                 let l_answers = std::mem::take(&mut *z_auth_answers.lock().unwrap());
+                let l_request = AUTH_REQUEST.with_borrow_mut(std::mem::take);
                 z_ui.set_auth_session("".into());
                 z_ui.set_prompts(ModelRc::default());
                 z_ui.set_auth_generation(z_ui.get_auth_generation()+1);
-                ("answer_auth",json!({"session_id":z_arg,"answers":l_answers}))
+                ("answer_auth",json!({"session_id":z_arg,"answers":l_answers,"auth_id":l_request}))
             }
             "run_command" => {
                 if z_arg.trim().is_empty() { return; }
@@ -1094,6 +1125,8 @@ pub fn run(
         let z_connection = z_ui.get_selected_connection().to_string();
         let z_group = z_ui.get_selected_connection_group().to_string();
         let z_session = z_ui.get_active_session().to_string();
+        // 下载针对列表中选中的文件: 带上列表所属连接的代次, 期间标签已重连时后台拒绝.
+        let z_listed_link = LISTED_LINK.with_borrow(|c| c.get(&z_session).copied());
         let z_selected_files = z_ui.get_files().iter().filter(|c| c.selected).collect::<Vec<_>>();
         let z_upload_target = z_ui.get_upload_target().to_string();
         let z_weak = z_weak.clone();
@@ -1121,7 +1154,7 @@ pub fn run(
                 // 系统对话框不能同时选文件和文件夹 (Windows), 分成两个入口.
                 let z_paths = if z_kind == "upload" { z_dialog.pick_files().await } else { z_dialog.pick_folders().await };
                 if let Some(z_paths) = z_paths {
-                    upload_paths(&tokio::runtime::Handle::current(), &z_backend, z_weak, z_session, z_upload_target, z_paths.into_iter().take(MAX_TRANSFER_ITEMS + 1).map(|c| c.path().to_path_buf()).collect());
+                    upload_paths(&tokio::runtime::Handle::current(), &z_backend, z_weak, z_session, z_listed_link, z_upload_target, z_paths.into_iter().take(MAX_TRANSFER_ITEMS + 1).map(|c| c.path().to_path_buf()).collect());
                 }
                 return;
             }
@@ -1195,7 +1228,7 @@ pub fn run(
                 let z_skipped = z_skip.iter().filter(|c| **c).count();
                 for (i, (z_file, z_local)) in z_selected_files.iter().zip(z_targets).enumerate() {
                     if z_skip[i] { continue; }
-                    let z_result = z_backend.call(if z_file.directory { "download_directory" } else { "download_file" },json!({"session_id":z_session,"local_path":z_local,"remote_path":z_file.path.to_string(),"overwrite":z_overwrite[i],"size_hint":z_file.size_bytes.parse::<u64>().ok()}),Actor::User).await;
+                    let z_result = z_backend.call(if z_file.directory { "download_directory" } else { "download_file" },json!({"session_id":z_session,"_link":z_listed_link,"local_path":z_local,"remote_path":z_file.path.to_string(),"overwrite":z_overwrite[i],"size_hint":z_file.size_bytes.parse::<u64>().ok()}),Actor::User).await;
                     if let Err(err) = z_result {
                         show_notice(z_weak, NOTE_ERROR, batch_error("下载", z_count, &err)); return;
                     }
@@ -1238,16 +1271,64 @@ pub fn run(
     let z_busy = Arc::new(AtomicBool::new(false));
     let z_poll_clock = Rc::new(Cell::new(Instant::now() - Duration::from_secs(1)));
     let z_dimensions = Rc::new(RefCell::new((String::new(), 0, 0)));
+    // 尺寸同步失败 (如重连期间会话短暂不存在) 时置位, 下次刷新清掉已记录的尺寸重新同步, 避免界面与终端尺寸长期不一致.
+    let z_resize_failed = Arc::new(AtomicBool::new(false));
     // 输出唤醒遇到进行中的刷新时记下, 完成后立即补一次, 不退回定时器周期.
     let z_rerun = Arc::new(AtomicBool::new(false));
     let z_wake_backend = c_backend.clone();
     let z_wake_runtime = c_runtime.clone();
     let z_weak = z_ui.as_weak();
     // 定时器负责状态轮询、尺寸和滚动同步; 终端新输出另由后台通知立即唤醒.
+    // 状态轮询 (会话、任务、监控) 每 500 毫秒一次, 有自己的忙标志: 要读配置并持全局锁, 偶尔较慢时不挡住终端画面刷新.
+    let z_state_busy = Arc::new(AtomicBool::new(false));
     let z_tick = Rc::new(move |c_wake: bool| {
         let Some(z_ui) = z_weak.upgrade() else {
             return;
         };
+        if z_poll_clock.get().elapsed() >= Duration::from_millis(500) && !z_state_busy.swap(true, Ordering::AcqRel) {
+            z_poll_clock.set(Instant::now());
+            let z_generation = z_view_generation.load(Ordering::Relaxed);
+            let z_selected_task = z_ui.get_selected_task().to_string();
+            let (z_backend, z_weak, z_state_busy, z_state, z_answers, z_refresh_runtime, z_view_generation) =
+                (c_backend.clone(), z_weak.clone(), z_state_busy.clone(), z_state.clone(), z_answers.clone(), c_runtime.clone(), z_view_generation.clone());
+            c_runtime.spawn(async move {
+                // 后台调用放进子任务: 万一 panic, 这里仍能释放忙标志.
+                let z_calls = {
+                    let (z_backend, z_selected_task) = (z_backend.clone(), z_selected_task.clone());
+                    tokio::spawn(async move {
+                        let z_new_state = z_backend.call("state", json!({}), Actor::User).await;
+                        let z_task = if z_selected_task.is_empty() {
+                            None
+                        } else {
+                            Some(z_backend.call("get_task", json!({"task_id":z_selected_task}), Actor::User).await)
+                        };
+                        (z_new_state, z_task)
+                    })
+                };
+                let Ok((z_new_state, z_task)) = z_calls.await else {
+                    z_state_busy.store(false, Ordering::Release);
+                    return;
+                };
+                let z_busy_fallback = z_state_busy.clone();
+                if slint::invoke_from_event_loop(move || {
+                    // A→B→A 时会话ID仍相同, 也不能应用切换前取到的旧状态; 无论是否应用都要释放忙标志.
+                    if let Some(z_ui) = z_weak.upgrade().filter(|_| z_view_generation.load(Ordering::Relaxed) == z_generation) {
+                        apply_polled_state(&z_ui, z_new_state, &z_state, &z_answers, &z_refresh_runtime, &z_backend);
+                        if let Some(Ok(z_value)) = z_task.filter(|_| z_ui.get_selected_task().as_str() == z_selected_task) {
+                            let z_output = task_output(&z_ui, &z_value);
+                            if z_ui.get_task_output().as_str() != z_output {
+                                z_ui.set_task_output(z_output.into());
+                            }
+                        }
+                    }
+                    z_state_busy.store(false, Ordering::Release);
+                })
+                .is_err()
+                {
+                    z_busy_fallback.store(false, Ordering::Release);
+                }
+            });
+        }
         if z_busy.swap(true, Ordering::AcqRel) {
             if c_wake {
                 z_rerun.store(true, Ordering::Release);
@@ -1260,12 +1341,14 @@ pub fn run(
         let z_scroll = z_ui.get_terminal_scroll_offset();
         // 只在拖选过程中暂停读取画面; 已有选区时照常刷新, 由 apply_polled_terminal 决定是否保留选区.
         let z_selection = z_ui.get_selection_dragging();
-        let z_selected_task = z_ui.get_selected_task().to_string();
         let z_size = (
             z_session.clone(),
             z_ui.get_terminal_rows(),
             z_ui.get_terminal_cols(),
         );
+        if z_resize_failed.swap(false, Ordering::AcqRel) {
+            z_dimensions.borrow_mut().0.clear();
+        }
         let z_resize = !z_session.is_empty() && !z_empty && *z_dimensions.borrow() != z_size;
         if z_resize {
             // 终端可显示的列数与行数, 随窗口变化并同步给服务器.
@@ -1290,74 +1373,66 @@ pub fn run(
             };
             (z_after_seq, z_read_view)
         };
-        let z_poll_state = z_poll_clock.get().elapsed() >= Duration::from_millis(500);
-        if z_poll_state {
-            z_poll_clock.set(Instant::now());
-        }
-        if !z_poll_state && (z_session.is_empty() || z_empty) {
+        if z_session.is_empty() || z_empty {
             z_busy.store(false, Ordering::Release);
             return;
         }
         let z_backend = c_backend.clone();
         let z_weak = z_weak.clone();
         let z_busy = z_busy.clone();
-        let z_state = z_state.clone();
         let z_sequence = z_sequence.clone();
-        let z_answers = z_answers.clone();
-        let z_refresh_runtime = c_runtime.clone();
         let z_view_generation = z_view_generation.clone();
         let z_rerun = z_rerun.clone();
+        let z_resize_failed = z_resize_failed.clone();
         c_runtime.spawn(async move {
-            if z_resize {
-                let _ = z_backend
-                    .call(
-                        "resize_terminal",
-                        json!({"session_id":z_size.0,"rows":z_size.1,"cols":z_size.2}),
-                        Actor::User,
-                    )
-                    .await;
-            }
-            let z_new_state = if z_poll_state {
-                Some(z_backend.call("state", json!({}), Actor::User).await)
-            } else {
-                None
+            // 后台调用放进子任务: 万一 panic, 这里仍能释放忙标志, 画面刷新不会就此停住.
+            let z_calls = {
+                let z_session = z_session.clone();
+                tokio::spawn(async move {
+                    if z_resize
+                        && z_backend
+                            .call("resize_terminal", json!({"session_id":z_size.0,"rows":z_size.1,"cols":z_size.2}), Actor::User)
+                            .await
+                            .is_err()
+                    {
+                        z_resize_failed.store(true, Ordering::Release);
+                    }
+                    let mut z_args = json!({"session_id":z_session,"max_lines":200,"scroll_offset":z_scroll});
+                    if z_selection || !z_read_view { z_args["events_only"] = json!(true); }
+                    if let Some(z_seq) = z_after_seq {
+                        z_args["after_seq"] = json!(z_seq);
+                    }
+                    let z_terminal = z_backend.call("read_terminal", z_args, Actor::User).await;
+                    // 后台终端尺寸与界面不符 (同标签重连后新会话沿用了旧尺寸、调整落到了旧会话等) 时重新同步; 比较前按后台上限截取.
+                    // 轻量结果 (拖选、翻看历史) 也带尺寸, 同样能发现.
+                    if let Ok(l_value) = &z_terminal
+                        && let (Some(l_rows), Some(l_cols)) = (l_value.get("rows").and_then(Value::as_i64), l_value.get("cols").and_then(Value::as_i64))
+                        && (l_rows, l_cols) != (i64::from(z_size.1.clamp(1, 200)), i64::from(z_size.2.clamp(1, 400)))
+                    {
+                        z_resize_failed.store(true, Ordering::Release);
+                    }
+                    z_terminal
+                })
             };
-            let z_terminal = if z_session.is_empty() || z_empty {
-                None
-            } else {
-                let mut z_args =
-                    json!({"session_id":z_session,"max_lines":200,"scroll_offset":z_scroll});
-                if z_selection || !z_read_view { z_args["events_only"] = json!(true); }
-                if let Some(z_seq) = z_after_seq {
-                    z_args["after_seq"] = json!(z_seq);
-                }
-                Some(z_backend.call("read_terminal", z_args, Actor::User).await)
-            };
-            let z_task = if z_poll_state && !z_selected_task.is_empty() {
-                Some(
-                    z_backend
-                        .call("get_task", json!({"task_id":z_selected_task}), Actor::User)
-                        .await,
-                )
-            } else {
-                None
+            let Ok(z_terminal) = z_calls.await else {
+                z_busy.store(false, Ordering::Release);
+                return;
             };
             let z_busy_fallback = z_busy.clone();
             if slint::invoke_from_event_loop(move || {
-                // A→B→A 时会话ID仍相同, 也不能应用切换前取到的旧状态; 无论是否应用都要释放忙标志.
-                if let Some(z_ui) = z_weak.upgrade().filter(|_| z_view_generation.load(Ordering::Relaxed) == z_generation) {
-                    if let Some(z_result) = z_new_state {
-                        apply_polled_state(&z_ui, z_result, &z_state, &z_answers, &z_refresh_runtime, &z_backend);
-                    }
-                    if let Some(Ok(z_value)) = z_terminal {
-                        apply_polled_terminal(&z_ui, &z_value, &z_session, z_scroll, &z_sequence);
-                    }
-                    if let Some(Ok(z_value)) = z_task.filter(|_| z_ui.get_selected_task().as_str() == z_selected_task) {
-                        let z_output = task_output(&z_ui, &z_value);
-                        if z_ui.get_task_output().as_str() != z_output {
-                            z_ui.set_task_output(z_output.into());
-                        }
-                    }
+                // 远端程序 (vim、tmux) 的复制请求已从后台取走, 同一标签内画面因代次变化被丢弃时也要写入剪贴板, 否则就此丢失;
+                // 已切到别的标签时不写入, 免得后台标签迟到的复制覆盖用户刚复制的内容.
+                if let (Some(z_ui), Ok(z_value)) = (z_weak.upgrade(), &z_terminal)
+                    && z_ui.get_active_session().as_str() == z_session
+                    && let Some(z_text) = z_value.get("clipboard").and_then(Value::as_str)
+                {
+                    z_ui.invoke_copy_text(z_text.into());
+                }
+                // A→B→A 时会话ID仍相同, 也不能应用切换前取到的旧画面; 无论是否应用都要释放忙标志.
+                if let Some(z_ui) = z_weak.upgrade().filter(|_| z_view_generation.load(Ordering::Relaxed) == z_generation)
+                    && let Ok(z_value) = z_terminal
+                {
+                    apply_polled_terminal(&z_ui, &z_value, &z_session, z_scroll, &z_sequence);
                 }
                 z_busy.store(false, Ordering::Release);
                 if z_rerun.swap(false, Ordering::AcqRel) {
@@ -1500,7 +1575,13 @@ fn apply_polled_state(
     // 同一标签重连沿用会话 ID, 两次轮询之间完成的重连看不到断开; 会话代次变了就作废旧列表, 下面按原目录重新读取.
     for l_session in array(&z_value, "sessions") {
         let l_id = string(l_session, "session_id");
-        if array(&z_old, "sessions").iter().any(|c| string(c, "session_id") == l_id && number(c, "link") != number(l_session, "link")) {
+        if let Some(l_terminal) = l_session.get("terminal").and_then(Value::as_u64) {
+            TERMINAL_GEN.lock().unwrap().insert(l_id.to_owned(), l_terminal);
+        }
+        // 新连接的列表已先到达时已在那里作废并重建 (见 list_files 回包), 不再重复清空.
+        if array(&z_old, "sessions").iter().any(|c| string(c, "session_id") == l_id && number(c, "link") != number(l_session, "link"))
+            && LISTED_LINK.with_borrow(|c| c.get(l_id).copied()) != l_session.get("link").and_then(Value::as_u64)
+        {
             // 后台标签保存的视图快照 (列表、已加载标记、选择) 一并作废, 切回时重新读取.
             c_ui.invoke_action("discard_files".into(), l_id.into());
         }
@@ -1580,9 +1661,6 @@ fn apply_polled_terminal(
 ) {
     if c_ui.get_active_session().as_str() != c_session {
         return;
-    }
-    if let Some(z_text) = c_value.get("clipboard").and_then(Value::as_str) {
-        c_ui.invoke_copy_text(z_text.into());
     }
     // 不刷新画面时 (翻看历史、拖选) 输入模式仍随远端更新, 按键和粘贴按最新模式编码.
     if boolean(c_value, "unchanged") && c_value.get("modified_keys").is_some() {
@@ -1681,6 +1759,9 @@ fn dispatch(
         }
         Some((z_ui.get_view_generation(), z_request))
     } else { None };
+    if matches!(c_method, "set_permissions" | "rename_file" | "delete_files" | "delete_files_fast" | "create_directory" | "create_file" | "copy_file" | "check_remote_names" | "file_details") {
+        attach_listed_link(&mut c_args);
+    }
     c_runtime.spawn(async move {
         let mut z_result = z_backend.call(&z_method, c_args.clone(), Actor::User).await;
         if z_method == "list_files" {
@@ -1868,11 +1949,14 @@ fn apply_file_selection(c_ui: &AppWindow, c_rows: Vec<FileRow>) {
     }
 }
 
+// c_link: 发起上传 (打开选择框或拖入) 时所展示列表的连接代次; 重名检查、覆盖确认后的提交都带上它,
+// 期间标签已重连时后台拒绝, 覆盖许可不会用到新连接上.
 fn upload_paths(
     c_runtime: &tokio::runtime::Handle,
     c_backend: &Arc<Backend>,
     c_weak: slint::Weak<AppWindow>,
     c_session: String,
+    c_link: Option<u64>,
     c_directory: String,
     c_paths: Vec<std::path::PathBuf>,
 ) {
@@ -1883,7 +1967,7 @@ fn upload_paths(
     let z_backend = c_backend.clone();
     c_runtime.spawn(async move {
         // 拖入上传不经过选择框, 在这里提前建立传输连接; 已建好时立即返回.
-        let _ = z_backend.call("warm_transfer", json!({"session_id":c_session}), Actor::User).await;
+        let _ = z_backend.call("warm_transfer", json!({"session_id":c_session,"_link":c_link}), Actor::User).await;
         for z_path in &c_paths {
             let Some(_) = z_path
                 .file_name()
@@ -1914,7 +1998,7 @@ fn upload_paths(
         // 检查失败时按无冲突处理: 任务不带覆盖许可, 由后台再次检查, 不会覆盖.
         show_notice(c_weak.clone(), NOTE_INFO, "正在检查目标目录中的同名文件...".into());
         let mut z_taken = z_backend
-            .call("check_remote_names", json!({"session_id":c_session,"directory":c_directory,"names":z_names}), Actor::User)
+            .call("check_remote_names", json!({"session_id":c_session,"_link":c_link,"directory":c_directory,"names":z_names}), Actor::User)
             .await
             .map(|c| array(&c, "existing").iter().filter_map(Value::as_str).map(str::to_owned).collect::<std::collections::HashSet<_>>())
             .unwrap_or_default();
@@ -1937,7 +2021,7 @@ fn upload_paths(
                 }
                 ConflictChoice::KeepBoth => {
                     // 保留两者时新名字也不能与已有文件重名: 此时才读取完整目录; 读取失败时仍由后台拒绝重名.
-                    if let Ok(l_list) = z_backend.call("list_files", json!({"session_id":c_session,"path":c_directory}), Actor::User).await {
+                    if let Ok(l_list) = z_backend.call("list_files", json!({"session_id":c_session,"_link":c_link,"path":c_directory}), Actor::User).await {
                         z_taken.extend(array(&l_list, "entries").iter().map(|l| string(l, "name").to_owned()));
                     }
                     for z_name in &mut z_names {
@@ -1957,7 +2041,7 @@ fn upload_paths(
             let z_result = z_backend
                 .call(
                     if z_path.is_dir() { "upload_directory" } else { "upload_file" },
-                    json!({"session_id":c_session,"local_path":z_path,"remote_path":z_remote,"overwrite":z_overwrite}),
+                    json!({"session_id":c_session,"_link":c_link,"local_path":z_path,"remote_path":z_remote,"overwrite":z_overwrite}),
                     Actor::User,
                 )
                 .await;
@@ -2294,6 +2378,14 @@ fn complete(c_weak: slint::Weak<AppWindow>, c_method: String, c_result: anyhow::
                             return;
                         }
                         let z_path = string(&z_value, "path");
+                        if let Some(l_link) = z_value.get("link").and_then(Value::as_u64) {
+                            let l_session = string(&z_value, "session_id");
+                            // 新连接的列表到达 (可能早于状态轮询发现重连): 先作废旧连接的文件列表、目录树、缓存和弹窗, 再按新列表重建.
+                            // 旧树节点不会留到新代次下, 从它们发起的操作也就带不上新代次.
+                            if LISTED_LINK.with_borrow_mut(|c| c.insert(l_session.to_owned(), l_link)).is_some_and(|c| c != l_link) {
+                                z_ui.invoke_action("discard_files".into(), l_session.into());
+                            }
+                        }
                         z_ui.set_browse_path(z_path.into());
                         z_ui.set_remote_listed_session(string(&z_value, "session_id").into());
                         z_ui.set_remote_ready(true);
@@ -2808,10 +2900,12 @@ fn apply_state(c_ui: &AppWindow, c_state: &Value, c_answers: &Arc<Mutex<Vec<Stri
     let z_prompts = z_auth
         .map(|c_item| array(c_item, "auth_prompts"))
         .unwrap_or(&[]);
-    // 认证弹窗只在提示变化时重建, 避免刷新清空正在输入的密码.
+    // 认证弹窗只在提示变化时重建, 避免刷新清空正在输入的密码. 请求标识随回答带回, 换了一轮请求 (文字相同也算) 就重建.
+    let z_request = z_auth.map(|c_item| string(c_item, "auth_id")).unwrap_or("");
     let z_old_prompts = c_ui.get_prompts();
     use slint::Model;
     let z_changed = c_ui.get_auth_session().as_str() != z_auth_id
+        || AUTH_REQUEST.with_borrow(|c| c != z_request)
         || z_old_prompts.row_count() != z_prompts.len()
         || z_prompts.iter().enumerate().any(|(i, c_item)| {
             z_old_prompts.row_data(i).is_none_or(|l_old| {
@@ -2836,6 +2930,7 @@ fn apply_state(c_ui: &AppWindow, c_state: &Value, c_answers: &Arc<Mutex<Vec<Stri
                 .collect::<Vec<_>>(),
         )));
         c_ui.set_auth_session(z_auth_id.into());
+        AUTH_REQUEST.with_borrow_mut(|c| *c = z_request.to_owned());
     }
 }
 
@@ -4153,8 +4248,12 @@ type InputQueue = (tokio::sync::mpsc::Sender<(String, String, (u64, u64))>, Inpu
 
 // 入队时记下该标签当前的输入代次; 空数据表示标签已关闭. 队列满时返回 false.
 // c_terminal: 非 0 时只写入该代次的终端 (后台核对), 0 为不限.
+// 不限代次的输入 (普通按键、粘贴、常用命令) 按最近一次状态轮询看到的后台终端代次绑定: MCP 或后台重开终端时,
+// 界面自己的输入代次不会变化, 靠它让按旧终端编码、排队中的输入不进入新终端.
+static TERMINAL_GEN: std::sync::LazyLock<Mutex<HashMap<String, u64>>> = std::sync::LazyLock::new(Default::default);
 fn enqueue_input(c_queue: &InputQueue, c_session: String, c_data: String, c_terminal: u64) -> bool {
     let z_epoch = c_queue.1.lock().unwrap().get(&c_session).copied().unwrap_or(0);
+    let c_terminal = if c_terminal == 0 { TERMINAL_GEN.lock().unwrap().get(&c_session).copied().unwrap_or(0) } else { c_terminal };
     c_queue.0.try_send((c_session, c_data, (z_epoch, c_terminal))).is_ok()
 }
 
