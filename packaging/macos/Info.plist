@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key><string>HiPShell</string>
+    <key>CFBundleDisplayName</key><string>HiPShell</string>
+    <key>CFBundleIdentifier</key><string>com.hipshow.hipssh</string>
+    <key>CFBundleExecutable</key><string>hipssh</string>
+    <key>CFBundleIconFile</key><string>HiPShell.icns</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleShortVersionString</key><string>1.3</string>
+    <key>CFBundleVersion</key><string>4</string>
+    <key>CFBundleDevelopmentRegion</key><string>zh-Hans</string>
+    <key>CFBundleLocalizations</key><array><string>zh-Hans</string></array>
+    <key>LSMinimumSystemVersion</key><string>11.0</string>
+    <key>NSHighResolutionCapable</key><true/>
+    <key>NSDesktopFolderUsageDescription</key><string>HiPShell 默认把下载的文件保存到桌面.</string>
+    <key>NSDocumentsFolderUsageDescription</key><string>HiPShell 需要读写文稿中的文件以完成上传和下载.</string>
+    <key>NSDownloadsFolderUsageDescription</key><string>HiPShell 需要读写下载文件夹中的文件以完成上传和下载.</string>
+    <key>NSHumanReadableCopyright</key><string>© 2026 HiPsHoW</string>
+</dict>
+</plist>

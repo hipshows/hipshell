@@ -1,0 +1,63 @@
+# Rust 构建缓存、可执行文件和 macOS 应用包均在 target 内.
+/target/
+*.rs.bk
+
+# 打包产物: dmg / zip 发布到 Release, Windows 编译副本每次由 run-macos.sh 重新生成.
+/dist/
+/windows-build/
+
+# 本机运行数据及 FinalShell 连接导出, 可能包含凭据和授权信息.
+/config/
+/.local/
+*_connect_config.json
+
+# 使用 --data-dir . 时写入项目根目录的运行文件.
+/settings.json
+/commands.json
+/proxies.json
+/known_hosts.json
+/native_bindings.json
+/migration.json
+/backend.json
+/backend.lock
+/backend-*.tmp
+/operations.jsonl
+/operations.previous.jsonl
+/keys/
+/fonts/
+/*.tmp-*
+
+# 本地密钥文件, 不读取或同步其内容.
+/.ssh/
+*.pem
+*.key
+*.ppk
+id_rsa
+id_rsa.*
+id_dsa
+id_dsa.*
+id_ecdsa
+id_ecdsa.*
+id_ed25519
+id_ed25519.*
+
+# 个人 AI 协作规则与本机工具配置, 不随源码发布.
+/AGENTS.md
+/CLAUDE.md
+/编译程序.md
+/.claude/
+/.codex/
+/.mcp.json
+
+# 编辑器配置、日志、临时文件及 macOS / Windows 系统杂项.
+/.vscode/
+/.idea/
+*.log
+*.swp
+*.swo
+*~
+.DS_Store
+._*
+.AppleDouble/
+Thumbs.db
+Desktop.ini

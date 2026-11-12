@@ -1,0 +1,7 @@
+// Slint 1.18.1 Fluent 菜单: 保留原有交互和主题, 只缩小空白宽度.
+import { MenuFrame as FluentMenuFrame } from "../fluent/menu.slint";
+export { MenuBarItem, MenuBar, MenuItem } from "../fluent/menu.slint";
+
+export component MenuFrame inherits FluentMenuFrame {
+    layout-min-width: 190px;
+}

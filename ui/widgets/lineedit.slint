@@ -1,0 +1,91 @@
+// Slint 1.18.1 Fluent 输入框的精简版: 外观与交互同原版, 只改三处:
+// 1. 选中文字用绿色 (原版取系统强调色, macOS 下为蓝色), 与全局强调色统一, 颜色同 Theme.text-selection;
+// 2. 不带内置的显示密码按钮, 密码框统一用外侧的眼睛按钮;
+// 3. 最小宽度 60px (原版 160px), 两栏表单里窄输入框不会把同行按钮挤出卡片.
+import { FluentPalette } from "styling.slint";
+import { LineEditBase, LineEditClearIcon } from "../common/lineedit-base.slint";
+import { Palette } from "std-widgets.slint";
+
+export component LineEdit {
+    in property <length> font-size <=> base.font-size;
+    in-out property <string> text <=> base.text;
+    in property <string> placeholder-text <=> base.placeholder-text;
+    in property <bool> enabled <=> base.enabled;
+    in property <bool> read-only <=> base.read-only;
+    in property <InputType> input-type <=> base.input-type;
+    in property <TextHorizontalAlignment> horizontal-alignment <=> base.horizontal-alignment;
+    out property <bool> has-focus: base.has-focus;
+    callback accepted <=> base.accepted;
+    callback edited <=> base.edited;
+
+    public function select-all() { base.select-all(); }
+    public function clear-selection() { base.clear-selection(); }
+    public function copy() { base.copy(); }
+    public function paste() { base.paste(); }
+
+    accessible-role: text-input;
+    accessible-enabled: root.enabled;
+    accessible-value <=> root.text;
+    accessible-placeholder-text: root.placeholder-text;
+    accessible-read-only: root.read-only;
+    accessible-action-set-value(c_value) => { root.text = c_value; root.edited(c_value); }
+    accessible-action-set-selection-offsets(c_anchor, c_focus) => { base.set-selection-offsets(c_anchor, c_focus); }
+
+    vertical-stretch: 0;
+    horizontal-stretch: 1;
+    min-width: max(60px, layout.min-width);
+    min-height: max(32px, layout.min-height);
+    forward-focus: base;
+
+    states [
+        disabled when !root.enabled : {
+            background.background: FluentPalette.control-disabled;
+            base.text-color: FluentPalette.text-disabled;
+            base.placeholder-color: FluentPalette.text-disabled;
+        }
+        focused when root.has-focus : {
+            background.background: FluentPalette.control-input-active;
+            focus-border.background: FluentPalette.accent-background;
+        }
+    ]
+
+    background := Rectangle {
+        border-radius: 4px;
+        background: FluentPalette.control-background;
+        border-width: 1px;
+        border-color: FluentPalette.text-control-border;
+
+        layout := HorizontalLayout {
+            padding-left: 12px;
+            padding-right: 12px;
+
+            base := LineEditBase {
+                selection-background-color: Palette.color-scheme == ColorScheme.light ? #159b7f40 : #38b29b66;
+                selection-foreground-color: FluentPalette.foreground;
+                text-color: FluentPalette.foreground;
+                placeholder-color: FluentPalette.text-secondary;
+                margin: layout.padding-left + layout.padding-right;
+                horizontal-stretch: 1;
+            }
+
+            if !root.text.is-empty && root.input-type != InputType.password && root.enabled && !root.read-only && root.has-focus: LineEditClearIcon {
+                width: 14px;
+                source: @image-url("../icons/x.svg");
+                colorize: base.text-color;
+                clear => {
+                    base.text = "";
+                    root.edited("");
+                    base.focus();
+                }
+            }
+        }
+
+        focus-border := Rectangle {
+            x: parent.border-radius;
+            y: parent.height - self.height;
+            width: parent.width - 2 * parent.border-radius;
+            height: 2px;
+            border-radius: 1px;
+        }
+    }
+}
