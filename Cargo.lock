@@ -2211,12 +2211,14 @@ checksum = "e712f64ec3850b98572bffac52e2c6f282b29fe6c5fa6d42334b30be438d95c1"
 
 [[package]]
 name = "hipssh"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "bytes",
  "cbc 0.1.2",
  "des 0.8.1",
+ "futures-util",
  "icu_normalizer",
  "md5 0.7.0",
  "rand 0.8.8",

@@ -13,6 +13,8 @@ struct DropBatch {
 }
 
 pub(crate) fn install(c_ui: &AppWindow) {
+    #[cfg(target_os = "macos")]
+    disable_app_nap();
     // 小屏或高缩放时默认窗口可能比屏幕还大 (标题栏或底部落在屏幕外): 窗口创建后发现放不下就最大化, 正好占满工作区.
     // 高度给任务栏、菜单栏约留出屏幕的 1/12.
     let z_weak = c_ui.as_weak();
@@ -40,10 +42,32 @@ pub(crate) fn install(c_ui: &AppWindow) {
     });
     let z_weak = c_ui.as_weak();
     let z_pending = Rc::new(RefCell::new(None::<DropBatch>));
+    let z_cursor = std::cell::Cell::new(None::<(f32, f32)>);
     let z_window = c_ui.window();
     #[cfg(windows)]
     let z_minimized = std::cell::Cell::new(false);
     z_window.on_winit_window_event(move |c_window, c_event| {
+        // 跟踪指针逻辑坐标, 供传输面板外部点击判断使用.
+        match c_event {
+            winit::event::WindowEvent::CursorMoved { position: l_pos, .. } => {
+                let l_scale = c_window.scale_factor() as f32;
+                z_cursor.set(Some((l_pos.x as f32 / l_scale, l_pos.y as f32 / l_scale)));
+            }
+            winit::event::WindowEvent::CursorLeft { .. } => {
+                z_cursor.set(None);
+            }
+            winit::event::WindowEvent::MouseInput { state: winit::event::ElementState::Pressed, .. } => {
+                if let Some(l_ui) = z_weak.upgrade().filter(|c| c.get_transfers_open()) {
+                    let l_pos = z_cursor.get().or_else(|| c_window.with_winit_window(drop_position).flatten());
+                    if l_pos.is_some_and(|(l_x, l_y)| l_ui.invoke_transfers_outside(l_x, l_y)) {
+                        l_ui.set_transfers_open(false);
+                    }
+                }
+                // 事件继续向下传递, 右键点击文件列表时关闭面板的同时仍立即弹出右键菜单.
+                return EventResult::Propagate;
+            }
+            _ => {}
+        }
         // Windows: 最小化期间绘制的内容不会留在窗口上, 恢复后软件渲染器仍认为缓冲区有效, 只补画变化的部分,
         // 窗口因此只显示一半或几块 (最大化时恢复动画更长, 更常见). 恢复、重新可见或获得焦点时让整窗重绘,
         // 动画期间画的帧可能再丢, 0.3 秒和 1 秒后各补一次. 启用 Skia 渲染时不走此路径, 仅显卡不可用退回软件渲染时需要.
@@ -107,15 +131,28 @@ pub(crate) fn install(c_ui: &AppWindow) {
             }
             return EventResult::Propagate;
         }
-        // 未启用原生菜单栏, macOS 的 ⌘Q 需要自行处理; 放在窗口事件钩子里, 焦点在任何输入框都生效.
-        #[cfg(target_os = "macos")]
         if let winit::event::WindowEvent::KeyboardInput { event, .. } = c_event {
-            if event.state.is_pressed()
-                && matches!(&event.logical_key, winit::keyboard::Key::Character(c) if c.eq_ignore_ascii_case("q"))
-                && z_weak.upgrade().is_some_and(|c| c.get_native_control())
-            {
-                let _ = slint::quit_event_loop();
-                return EventResult::PreventDefault;
+            if event.state.is_pressed() {
+                // 未启用原生菜单栏, macOS 的 ⌘Q 需要自行处理; 放在窗口事件钩子里, 焦点在任何输入框都生效.
+                if cfg!(target_os = "macos")
+                    && matches!(&event.logical_key, winit::keyboard::Key::Character(c) if c.eq_ignore_ascii_case("q"))
+                    && z_weak.upgrade().is_some_and(|c| c.get_native_control())
+                {
+                    let _ = slint::quit_event_loop();
+                    return EventResult::PreventDefault;
+                }
+                if matches!(event.logical_key, winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape))
+                    && z_weak.upgrade().is_some_and(|c| {
+                        if c.get_transfers_open() && !c.get_conflict_open() {
+                            c.set_transfers_open(false);
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                {
+                    return EventResult::PreventDefault;
+                }
             }
         }
         if matches!(c_event, winit::event::WindowEvent::Focused(false)) {
@@ -144,17 +181,18 @@ pub(crate) fn install(c_ui: &AppWindow) {
             z_ui.set_status("请将文件拖入已连接的文件管理区域".into());
             return EventResult::PreventDefault;
         }
+        let z_cap = (z_ui.get_transfer_batch_limit().max(1) as usize) + 1;
         let z_schedule = z_pending.borrow().is_none();
         {
             let mut z_pending = z_pending.borrow_mut();
             let z_batch = z_pending.get_or_insert_with(|| DropBatch {
-                paths: Vec::with_capacity(17),
+                paths: Vec::with_capacity(z_cap.min(64)),
                 session: z_ui.get_active_session().to_string(),
                 directory: z_ui.get_browse_path().to_string(),
                 position: z_position,
             });
-            // 合并同一批系统事件, 第17项触发既有的整批数量限制.
-            if z_batch.paths.len() < 17 && !z_batch.paths.contains(&z_path) {
+            // 合并同一批系统事件, 多收 1 项以便交由 upload_paths 统一提示超出单次数量上限.
+            if z_batch.paths.len() < z_cap && !z_batch.paths.contains(&z_path) {
                 z_batch.paths.push(z_path.clone());
             }
         }
@@ -272,4 +310,56 @@ fn drop_position(c_window: &winit::window::Window) -> Option<(f32, f32)> {
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn drop_position(_: &winit::window::Window) -> Option<(f32, f32)> {
     None
+}
+
+// 阻止 macOS App Nap 在窗口切到后台时挂起定时器和网络轮询, 同时允许系统正常空闲睡眠.
+#[cfg(target_os = "macos")]
+fn disable_app_nap() {
+    use std::ffi::{c_char, c_void};
+    static Z_ONCE: std::sync::Once = std::sync::Once::new();
+    Z_ONCE.call_once(|| {
+        #[link(name = "objc")]
+        unsafe extern "C" {
+            #[link_name = "objc_getClass"]
+            fn objc_get_class(c_name: *const c_char) -> *mut c_void;
+            #[link_name = "objc_msgSend"]
+            fn objc_msg_send();
+            #[link_name = "sel_registerName"]
+            fn sel_register_name(c_name: *const c_char) -> *const c_void;
+        }
+        // NSActivityUserInitiatedAllowingIdleSystemSleep = 0x00FFFFFF & ~(1 << 20).
+        const ACTIVITY_OPTIONS: u64 = 0x00EF_FFFF;
+        unsafe {
+            let z_info_cls = objc_get_class(c"NSProcessInfo".as_ptr());
+            let z_str_cls = objc_get_class(c"NSString".as_ptr());
+            if z_info_cls.is_null() || z_str_cls.is_null() {
+                return;
+            }
+            let z_send_id: unsafe extern "C" fn(*mut c_void, *const c_void) -> *mut c_void =
+                std::mem::transmute(objc_msg_send as unsafe extern "C" fn());
+            let z_send_str: unsafe extern "C" fn(*mut c_void, *const c_void, *const c_char) -> *mut c_void =
+                std::mem::transmute(objc_msg_send as unsafe extern "C" fn());
+            let z_send_begin: unsafe extern "C" fn(*mut c_void, *const c_void, u64, *mut c_void) -> *mut c_void =
+                std::mem::transmute(objc_msg_send as unsafe extern "C" fn());
+            let z_info = z_send_id(z_info_cls, sel_register_name(c"processInfo".as_ptr()));
+            let z_reason = z_send_str(
+                z_str_cls,
+                sel_register_name(c"stringWithUTF8String:".as_ptr()),
+                c"SSH active sessions".as_ptr(),
+            );
+            if z_info.is_null() || z_reason.is_null() {
+                return;
+            }
+            let z_token = z_send_begin(
+                z_info,
+                sel_register_name(c"beginActivityWithOptions:reason:".as_ptr()),
+                ACTIVITY_OPTIONS,
+                z_reason,
+            );
+            if !z_token.is_null() {
+                // retain 保证活动令牌在进程运行期间始终有效.
+                let _ = z_send_id(z_token, sel_register_name(c"retain".as_ptr()));
+            }
+        }
+    });
 }

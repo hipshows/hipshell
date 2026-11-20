@@ -1,6 +1,6 @@
 [package]
 name = "hipssh"
-version = "1.5.0"
+version = "1.6.0"
 authors = ["HiPsHoW"]
 edition = "2024"
 description = "GUI 与 MCP 共用后台的轻量 SSH 客户端"
@@ -13,8 +13,10 @@ desktop = ["dep:slint", "dep:rfd", "dep:icu_normalizer"]
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
+bytes = "1"
 cbc = { version = "0.1", features = ["alloc", "block-padding"] }
 des = "0.8"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 md5 = "0.7"
 rand = "0.8"
 russh = { version = "0.65.1", default-features = false, features = ["ring", "rsa"] }

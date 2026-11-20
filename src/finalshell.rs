@@ -1,5 +1,5 @@
 use crate::{
-    config::ConfigStore,
+    config::{ConfigStore, MAX_FILE_SIZE, read_limited_bytes, write_bytes_atomic, write_private_new},
     model::{AdminPassword, AuthMethod, Connection},
 };
 use anyhow::{Context, Result, ensure};
@@ -12,12 +12,10 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    io::{Read, Write},
     path::{Path, PathBuf},
 };
 use zeroize::{Zeroize, Zeroizing};
 
-const MAX_FILE_SIZE: u64 = 1024 * 1024;
 pub(super) const MAX_CONNECTIONS: usize = 512;
 const MAX_IMPORT_BYTES: usize = 32 * 1024 * 1024;
 const GROUP_DESCRIPTION_PREFIX: &str = "HiPssh group: ";
@@ -73,7 +71,7 @@ fn default_auth_type() -> i64 {
 }
 
 pub(super) fn native_records(c_path: &Path) -> Result<(Vec<serde_json::Value>, String)> {
-    let z_bytes = read_file(c_path)?;
+    let z_bytes = read_limited_bytes(c_path).context("读取 FinalShell 文件失败")?;
     let z_value: serde_json::Value =
         serde_json::from_slice(&z_bytes).context("解析 FinalShell JSON 失败")?;
     let z_records = match z_value {
@@ -203,7 +201,7 @@ pub(super) fn write_native_record(
 ) -> Result<()> {
     if let Some(z_expected) = c_expected_fingerprint {
         ensure!(
-            format!("{:x}", md5::compute(read_file(c_path)?)) == z_expected,
+            format!("{:x}", md5::compute(read_limited_bytes(c_path)?)) == z_expected,
             "连接文件已在外部修改, 请重新打开确认"
         );
     }
@@ -212,7 +210,7 @@ pub(super) fn write_native_record(
     if c_overwrite {
         write_atomic(c_path, &z_bytes)
     } else {
-        write_new(c_path, &z_bytes)
+        write_private_new(c_path, &z_bytes).context("新建 FinalShell 文件失败")
     }
 }
 
@@ -397,7 +395,7 @@ fn import_records(c_path: &Path) -> Result<Vec<(PathBuf, serde_json::Value)>> {
     let mut z_records = Vec::new();
     let mut z_total_bytes = 0usize;
     for z_path in z_files {
-        let z_bytes = read_file(&z_path)
+        let z_bytes = read_limited_bytes(&z_path)
             .with_context(|| format!("读取导入文件 {} 失败", z_path.display()))?;
         z_total_bytes += z_bytes.len();
         ensure!(
@@ -535,7 +533,7 @@ pub(super) fn export_all(
     }
     fs::create_dir_all(c_directory).context("创建导出目录失败")?;
     for (i, (z_path, z_bytes)) in z_pending.iter().enumerate() {
-        write_new(z_path, z_bytes)
+        write_private_new(z_path, z_bytes)
             .with_context(|| format!("已导出 {i} 条连接, 写入 {} 失败", z_path.display()))?;
     }
     Ok(z_pending.len())
@@ -687,72 +685,5 @@ fn write_atomic(c_path: &Path, c_bytes: &[u8]) -> Result<()> {
             "FinalShell 目标必须是普通文件"
         );
     }
-    let z_temp: PathBuf = c_path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
-    let mut z_options = fs::OpenOptions::new();
-    z_options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        z_options.mode(0o600);
-    }
-    let z_result = (|| -> Result<()> {
-        let mut z_file = z_options
-            .open(&z_temp)
-            .context("创建 FinalShell 临时文件失败")?;
-        z_file
-            .write_all(c_bytes)
-            .context("写入 FinalShell 临时文件失败")?;
-        z_file.sync_all().context("同步 FinalShell 临时文件失败")?;
-        drop(z_file);
-        fs::rename(&z_temp, c_path).context("替换 FinalShell 文件失败")
-    })();
-    if z_result.is_err() {
-        let _ = fs::remove_file(&z_temp);
-    }
-    z_result
-}
-
-fn write_new(c_path: &Path, c_bytes: &[u8]) -> Result<()> {
-    let mut z_options = fs::OpenOptions::new();
-    z_options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        z_options.mode(0o600);
-    }
-    let mut z_file = z_options
-        .open(c_path)
-        .context("创建 FinalShell 文件失败, 不覆盖已有文件")?;
-    let z_result = z_file
-        .write_all(c_bytes)
-        .and_then(|_| z_file.sync_all())
-        .context("写入 FinalShell 文件失败");
-    drop(z_file);
-    if z_result.is_err() {
-        let _ = fs::remove_file(c_path);
-    }
-    z_result
-}
-
-fn read_file(c_path: &Path) -> Result<Vec<u8>> {
-    let z_meta = fs::symlink_metadata(c_path).context("读取 FinalShell 文件信息失败")?;
-    ensure!(
-        z_meta.file_type().is_file(),
-        "FinalShell 路径必须是普通文件"
-    );
-    ensure!(
-        z_meta.len() <= MAX_FILE_SIZE,
-        "FinalShell 文件超过 1 MiB 限制"
-    );
-    let z_file = fs::File::open(c_path).context("打开 FinalShell 文件失败")?;
-    let mut z_bytes = Vec::new();
-    z_file
-        .take(MAX_FILE_SIZE + 1)
-        .read_to_end(&mut z_bytes)
-        .context("读取 FinalShell 文件失败")?;
-    ensure!(
-        z_bytes.len() as u64 <= MAX_FILE_SIZE,
-        "FinalShell 文件超过 1 MiB 限制"
-    );
-    Ok(z_bytes)
+    write_bytes_atomic(c_path, c_bytes).context("替换 FinalShell 文件失败")
 }

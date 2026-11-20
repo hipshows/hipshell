@@ -12,11 +12,17 @@ use std::{
 };
 use zeroize::Zeroizing;
 
-const MAX_FILE_SIZE: u64 = 1024 * 1024;
+pub(crate) const MAX_FILE_SIZE: u64 = 1024 * 1024;
 // 终端历史行数可选值; 每行约占 列数 x 32 字节, 1 万行 160 列约 50 MiB.
 pub const TERMINAL_SCROLLBACK_CHOICES: [u32; 4] = [1000, 2000, 5000, 10000];
 // 连接管理列表默认列宽 (逻辑像素): 主机、端口、用户、认证、代理.
 pub const CONNECTION_COLUMNS: [u32; 5] = [130, 50, 80, 48, 80];
+// 同时传输数 (所有服务器合计) 与单次选择/拖入的传输项数上限及默认值.
+pub const MAX_TRANSFER_CONCURRENCY: u32 = 16;
+pub const MAX_TRANSFER_BATCH: u32 = 2000;
+const DEFAULT_TERMINAL_SCROLLBACK: u32 = 2000;
+const DEFAULT_TRANSFER_CONCURRENCY: u32 = 3;
+const DEFAULT_TRANSFER_BATCH: u32 = 64;
 
 #[derive(Clone, Serialize, Deserialize, Default)]
 struct HostKeys(HashMap<String, String>);
@@ -41,6 +47,9 @@ pub struct AppSettings {
     pub connection_order: Vec<String>,
     // 每个标签保留的终端历史行数, 超出后覆盖最旧的内容; 新连接生效.
     pub terminal_scrollback: u32,
+    // 同时进行的传输数 (立即生效) 与一次最多选择或拖入的传输项数.
+    pub transfer_concurrency: u32,
+    pub transfer_batch: u32,
     // MCP 服务开关与本机端口; 端口固定, 客户端配置的网址才长期有效.
     pub mcp_enabled: bool,
     pub mcp_port: u16,
@@ -85,7 +94,9 @@ impl Default for AppSettings {
             terminal_font_size: 13,
             connection_groups: Vec::new(),
             connection_order: Vec::new(),
-            terminal_scrollback: 2000,
+            terminal_scrollback: DEFAULT_TERMINAL_SCROLLBACK,
+            transfer_concurrency: DEFAULT_TRANSFER_CONCURRENCY,
+            transfer_batch: DEFAULT_TRANSFER_BATCH,
             mcp_enabled: true,
             mcp_port: crate::mcp::DEFAULT_PORT,
             layout: WindowLayout::default(),
@@ -154,12 +165,20 @@ impl ConfigStore {
         };
         validate_host_keys(&z_host_keys)?;
         let z_settings_path = c_path.join("settings.json");
-        let mut z_settings = if z_settings_path.exists() {
-            read_json_limited(&z_settings_path)?
+        let z_raw = if z_settings_path.exists() {
+            Some(read_json_limited::<serde_json::Value>(&z_settings_path)?)
         } else {
-            AppSettings::default()
+            None
         };
-        normalize_recent(&mut z_settings);
+        let mut z_settings: AppSettings = match &z_raw {
+            Some(l_raw) => serde_json::from_value(l_raw.clone()).context("解析配置 JSON 失败")?,
+            None => AppSettings::default(),
+        };
+        normalize_settings(&mut z_settings);
+        // 首次启动无配置文件, 或旧版配置缺少新字段、手改越界被修正时立即落盘.
+        if z_raw.as_ref() != Some(&serde_json::to_value(&z_settings).context("编码配置 JSON 失败")?) {
+            write_json_atomic(&z_settings_path, &z_settings)?;
+        }
         Ok(Self {
             directory: c_path,
             state: Mutex::new(Volatile {
@@ -223,10 +242,7 @@ impl ConfigStore {
 
     // 列宽限制在界面允许的拖动范围内 (40-400), 个数不对时恢复默认.
     pub fn set_connection_columns(&self, mut c_columns: Vec<u32>) -> Result<()> {
-        if c_columns.len() != CONNECTION_COLUMNS.len() {
-            c_columns = CONNECTION_COLUMNS.to_vec();
-        }
-        c_columns.iter_mut().for_each(|c| *c = (*c).clamp(40, 400));
+        normalize_columns(&mut c_columns);
         self.update_settings(|c| {
             let l_changed = c.connection_columns != c_columns;
             c.connection_columns = c_columns;
@@ -259,16 +275,19 @@ impl ConfigStore {
         self.update_settings(|c| std::mem::replace(&mut c.terminal_scrollback, c_lines) != c_lines)
     }
 
+    pub fn set_transfer_limits(&self, c_concurrency: u32, c_batch: u32) -> Result<()> {
+        ensure!((1..=MAX_TRANSFER_CONCURRENCY).contains(&c_concurrency), "同时传输数范围为 1-{MAX_TRANSFER_CONCURRENCY}");
+        ensure!((1..=MAX_TRANSFER_BATCH).contains(&c_batch), "单次传输数量范围为 1-{MAX_TRANSFER_BATCH}");
+        self.update_settings(|c| {
+            let l_changed = c.transfer_concurrency != c_concurrency || c.transfer_batch != c_batch;
+            c.transfer_concurrency = c_concurrency;
+            c.transfer_batch = c_batch;
+            l_changed
+        })
+    }
+
     pub fn set_layout(&self, mut c_layout: WindowLayout) -> Result<()> {
-        // 面板尺寸限制在界面允许的拖动范围内, 手改配置文件也不会得到异常布局.
-        c_layout.monitor_width = c_layout.monitor_width.clamp(220, 520);
-        c_layout.bottom_height = c_layout.bottom_height.clamp(150, 2000);
-        c_layout.bottom_page = c_layout.bottom_page.clamp(0, 2);
-        c_layout.expanded_groups.truncate(256);
-        // 窗口低于界面最小尺寸 (800x540) 视为无效, 下次按默认大小打开.
-        if c_layout.width < 800 || c_layout.height < 540 {
-            (c_layout.width, c_layout.height) = (0, 0);
-        }
+        normalize_layout(&mut c_layout);
         self.update_settings(|c| {
             let l_changed = c.layout != c_layout;
             c.layout = c_layout;
@@ -374,6 +393,11 @@ impl ConfigStore {
     // 修改函数返回是否有变化; 无变化时不写文件.
     fn update_settings(&self, c_change: impl FnOnce(&mut AppSettings) -> bool) -> Result<()> {
         let _z_write = self.write_lock.lock().unwrap_or_else(PoisonError::into_inner);
+        self.update_settings_locked(c_change)
+    }
+
+    // 调用方持有 write_lock, 连接文件操作和设置更新可以串行提交.
+    fn update_settings_locked(&self, c_change: impl FnOnce(&mut AppSettings) -> bool) -> Result<()> {
         let mut z_state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let mut z_settings = z_state.settings.clone();
         if !c_change(&mut z_settings) {
@@ -387,32 +411,29 @@ impl ConfigStore {
     pub fn record_recent(&self, c_id: &str) -> Result<()> {
         let _z_write = self.write_lock.lock().unwrap_or_else(PoisonError::into_inner);
         self.get(c_id)?;
-        let mut z_state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut z_settings = z_state.settings.clone();
-        z_settings.recent_connections.retain(|c_old| c_old != c_id);
-        z_settings.recent_connections.insert(0, c_id.to_owned());
-        z_settings.recent_connections.truncate(20);
-        write_json_atomic(&self.directory.join("settings.json"), &z_settings)?;
-        z_state.settings = z_settings;
-        Ok(())
+        self.update_settings_locked(|c| {
+            if c.recent_connections.first().is_some_and(|l| l == c_id) {
+                return false;
+            }
+            c.recent_connections.retain(|l| l != c_id);
+            c.recent_connections.insert(0, c_id.to_owned());
+            c.recent_connections.truncate(20);
+            true
+        })
     }
 
     // c_id 为 None 时清空全部最近连接, 否则只移除该条; 无变化不写盘.
     pub fn clear_recent(&self, c_id: Option<&str>) -> Result<()> {
         let _z_write = self.write_lock.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut z_state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let z_recent = &z_state.settings.recent_connections;
-        if !c_id.map_or(!z_recent.is_empty(), |c_id| z_recent.iter().any(|c| c == c_id)) {
-            return Ok(());
-        }
-        let mut z_settings = z_state.settings.clone();
-        match c_id {
-            Some(l_id) => z_settings.recent_connections.retain(|c| c != l_id),
-            None => z_settings.recent_connections.clear(),
-        }
-        write_json_atomic(&self.directory.join("settings.json"), &z_settings)?;
-        z_state.settings = z_settings;
-        Ok(())
+        self.clear_recent_locked(c_id)
+    }
+
+    fn clear_recent_locked(&self, c_id: Option<&str>) -> Result<()> {
+        self.update_settings_locked(|c| {
+            let l_before = c.recent_connections.len();
+            c.recent_connections.retain(|l| c_id.is_some_and(|id| l != id));
+            c.recent_connections.len() != l_before
+        })
     }
 
     pub fn list(&self) -> Vec<Connection> {
@@ -614,12 +635,7 @@ impl ConfigStore {
         let z_path = native_path(&self.directory, c_id)?;
         fs::remove_file(&z_path).context("删除连接配置失败")?;
         self.file_cache.lock().unwrap_or_else(PoisonError::into_inner).remove(&z_path);
-        let mut z_state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut z_settings = z_state.settings.clone();
-        z_settings.recent_connections.retain(|c_old| c_old != c_id);
-        write_json_atomic(&self.directory.join("settings.json"), &z_settings)?;
-        z_state.settings = z_settings;
-        Ok(())
+        self.clear_recent_locked(Some(c_id))
     }
 
     pub fn import_finalshell(&self, c_path: &Path, c_group: Option<&str>) -> Result<(Vec<Connection>, Vec<String>)> {
@@ -876,12 +892,49 @@ fn insert_operation_id(
     }
 }
 
-fn normalize_recent(c_settings: &mut AppSettings) {
+// 手改或旧版配置缺失/超出允许范围时规范化并退回默认值.
+fn normalize_settings(c_settings: &mut AppSettings) {
     let mut z_seen = HashSet::new();
     c_settings
         .recent_connections
         .retain(|c_id| uuid::Uuid::parse_str(c_id).is_ok() && z_seen.insert(c_id.clone()));
     c_settings.recent_connections.truncate(20);
+    if !TERMINAL_SCROLLBACK_CHOICES.contains(&c_settings.terminal_scrollback) {
+        c_settings.terminal_scrollback = DEFAULT_TERMINAL_SCROLLBACK;
+    }
+    if !(1..=MAX_TRANSFER_CONCURRENCY).contains(&c_settings.transfer_concurrency) {
+        c_settings.transfer_concurrency = DEFAULT_TRANSFER_CONCURRENCY;
+    }
+    if !(1..=MAX_TRANSFER_BATCH).contains(&c_settings.transfer_batch) {
+        c_settings.transfer_batch = DEFAULT_TRANSFER_BATCH;
+    }
+    if !(9..=28).contains(&c_settings.terminal_font_size) {
+        c_settings.terminal_font_size = 13;
+    }
+    if c_settings.mcp_port < 1024 {
+        c_settings.mcp_port = crate::mcp::DEFAULT_PORT;
+    }
+    normalize_columns(&mut c_settings.connection_columns);
+    normalize_layout(&mut c_settings.layout);
+}
+
+fn normalize_columns(c_columns: &mut Vec<u32>) {
+    if c_columns.len() != CONNECTION_COLUMNS.len() {
+        *c_columns = CONNECTION_COLUMNS.to_vec();
+    }
+    c_columns.iter_mut().for_each(|c| *c = (*c).clamp(40, 400));
+}
+
+fn normalize_layout(c_layout: &mut WindowLayout) {
+    // 面板尺寸限制在界面允许的拖动范围内, 手改配置文件也不会得到异常布局.
+    c_layout.monitor_width = c_layout.monitor_width.clamp(220, 520);
+    c_layout.bottom_height = c_layout.bottom_height.clamp(150, 2000);
+    c_layout.bottom_page = c_layout.bottom_page.clamp(0, 2);
+    c_layout.expanded_groups.truncate(256);
+    // 窗口低于界面最小尺寸 (800x540) 视为无效, 下次按默认大小打开.
+    if c_layout.width < 800 || c_layout.height < 540 {
+        (c_layout.width, c_layout.height) = (0, 0);
+    }
 }
 
 fn validate_host_keys(c_hosts: &HostKeys) -> Result<()> {
@@ -935,20 +988,17 @@ fn read_json_limited<T: for<'de> Deserialize<'de>>(c_path: &Path) -> Result<T> {
     serde_json::from_slice(&z_data).context("解析配置 JSON 失败")
 }
 
-fn read_limited_bytes(c_path: &Path) -> Result<Vec<u8>> {
-    let z_meta = fs::symlink_metadata(c_path).context("读取配置文件信息失败")?;
-    ensure!(z_meta.file_type().is_file(), "配置路径必须是普通文件");
-    ensure!(z_meta.len() <= MAX_FILE_SIZE, "配置文件超过 1 MiB 限制");
-    let z_file = fs::File::open(c_path).context("打开配置文件失败")?;
+pub(crate) fn read_limited_bytes(c_path: &Path) -> Result<Vec<u8>> {
+    let z_meta = fs::symlink_metadata(c_path).context("读取文件信息失败")?;
+    ensure!(z_meta.file_type().is_file(), "路径必须是普通文件");
+    ensure!(z_meta.len() <= MAX_FILE_SIZE, "文件超过 1 MiB 限制");
+    let z_file = fs::File::open(c_path).context("打开文件失败")?;
     let mut z_data = Vec::new();
     z_file
         .take(MAX_FILE_SIZE + 1)
         .read_to_end(&mut z_data)
-        .context("读取配置文件失败")?;
-    ensure!(
-        z_data.len() as u64 <= MAX_FILE_SIZE,
-        "配置文件超过 1 MiB 限制"
-    );
+        .context("读取文件失败")?;
+    ensure!(z_data.len() as u64 <= MAX_FILE_SIZE, "文件超过 1 MiB 限制");
     Ok(z_data)
 }
 
@@ -968,16 +1018,22 @@ fn stored_admin(c_value: &serde_json::Value) -> &str {
 
 fn write_json_atomic<T: Serialize>(c_path: &Path, c_value: &T) -> Result<()> {
     let z_bytes = serde_json::to_vec(c_value).context("编码配置 JSON 失败")?;
+    ensure!(z_bytes.len() as u64 <= MAX_FILE_SIZE, "配置文件超过 1 MiB 限制");
     write_bytes_atomic(c_path, &z_bytes)
 }
 
 // 先写同目录临时文件 (仅本人可读) 再改名替换, 中途失败不会留下半个文件.
-fn write_bytes_atomic(c_path: &Path, z_bytes: &[u8]) -> Result<()> {
-    ensure!(
-        z_bytes.len() as u64 <= MAX_FILE_SIZE,
-        "配置文件超过 1 MiB 限制"
-    );
+pub(crate) fn write_bytes_atomic(c_path: &Path, c_bytes: &[u8]) -> Result<()> {
     let z_temp = c_path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
+    write_private_new(&z_temp, c_bytes).context("写入临时文件失败")?;
+    let z_result = fs::rename(&z_temp, c_path).context("替换文件失败");
+    if z_result.is_err() {
+        let _ = fs::remove_file(&z_temp);
+    }
+    z_result
+}
+
+pub(crate) fn write_private_new(c_path: &Path, c_bytes: &[u8]) -> Result<()> {
     let mut z_options = fs::OpenOptions::new();
     z_options.write(true).create_new(true);
     #[cfg(unix)]
@@ -985,15 +1041,11 @@ fn write_bytes_atomic(c_path: &Path, z_bytes: &[u8]) -> Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         z_options.mode(0o600);
     }
-    let mut z_file = z_options.open(&z_temp).context("创建临时配置文件失败")?;
-    let z_result = (|| -> Result<()> {
-        z_file.write_all(z_bytes).context("写入临时配置文件失败")?;
-        z_file.sync_all().context("同步临时配置文件失败")?;
-        drop(z_file);
-        fs::rename(&z_temp, c_path).context("替换配置文件失败")
-    })();
+    let mut z_file = z_options.open(c_path).context("排他创建文件失败")?;
+    let z_result = z_file.write_all(c_bytes).and_then(|_| z_file.sync_all()).context("写入文件失败");
+    drop(z_file);
     if z_result.is_err() {
-        let _ = fs::remove_file(&z_temp);
+        let _ = fs::remove_file(c_path);
     }
     z_result
 }

@@ -39,14 +39,8 @@ pub(crate) fn register_downloaded(c_dir: &Path) {
     let Ok(z_entries) = std::fs::read_dir(c_dir) else {
         return;
     };
-    let mut z_collection = slint::fontique_011::shared_collection();
-    for z_path in z_entries.flatten().map(|c| c.path()) {
-        if z_path.extension().is_some_and(|c| c.eq_ignore_ascii_case("ttf")) {
-            if let Ok(z_bytes) = std::fs::read(&z_path) {
-                z_collection.register_fonts(fontique::Blob::new(Arc::new(z_bytes)), None);
-            }
-        }
-    }
+    register_files(z_entries.flatten().map(|c| c.path())
+        .filter(|c| c.extension().is_some_and(|l| l.eq_ignore_ascii_case("ttf"))));
 }
 
 // 当前可用的候选字体 (系统已安装或已下载), 未安装的不出现在列表里.
@@ -96,7 +90,7 @@ pub(crate) fn download(c_name: &str, c_dir: &Path) -> Result<Vec<PathBuf>> {
     z_result
 }
 
-pub(crate) fn register_files(c_files: &[PathBuf]) {
+pub(crate) fn register_files(c_files: impl IntoIterator<Item = impl AsRef<Path>>) {
     let mut z_collection = slint::fontique_011::shared_collection();
     for z_path in c_files {
         if let Ok(z_bytes) = std::fs::read(z_path) {

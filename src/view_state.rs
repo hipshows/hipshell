@@ -2,8 +2,6 @@ use crate::ui::{AppWindow, DirectoryRow, FileRow, TerminalRun};
 use slint::{Model, ModelRc, SharedString};
 use std::collections::HashMap;
 
-const MAX_VIEWS: usize = 32;
-
 #[derive(Default)]
 pub(crate) struct SessionViews {
     active_id: String,
@@ -18,24 +16,23 @@ impl SessionViews {
         self.retain(c_ui);
         let z_sessions = c_ui.get_sessions();
         // 关闭后的标签不再保存, 避免把删除的视图重新放回缓存.
-        if !self.active_id.is_empty()
-            && z_sessions
-                .iter()
-                .any(|c| c.id.as_str() == self.active_id.as_str())
-            && (self.views.contains_key(&self.active_id) || self.views.len() < MAX_VIEWS)
-        {
+        if z_sessions.iter().any(|c| c.id.as_str() == self.active_id) {
             self.views
                 .insert(self.active_id.clone(), SessionView::capture(c_ui));
         }
         self.active_id = c_id.to_owned();
         c_ui.set_active_session(c_id.into());
-        c_ui.invoke_reveal_session_tab(z_sessions.iter().position(|c| c.id.as_str() == c_id).map(|c| c as i32).unwrap_or(-1));
-        let z_row = z_sessions.iter().find(|c| c.id.as_str() == c_id);
+        let z_row = z_sessions.iter().enumerate().find(|(_, c)| c.id.as_str() == c_id);
+        c_ui.invoke_reveal_session_tab(z_row.as_ref().map_or(-1, |(i, _)| *i as i32));
+        let z_row = z_row.map(|(_, c)| c);
         c_ui.set_active_session_empty(z_row.as_ref().is_none_or(|c| c.empty));
+        c_ui.set_active_connected(z_row.as_ref().is_some_and(|c| c.connected));
         c_ui.set_active_state(z_row.as_ref().map(|c| c.state).unwrap_or(0));
         // 连接 ID 与失败原因随下一次状态刷新填入, 切换时先清空, 避免"编辑连接"指向上一个标签.
         c_ui.set_active_connection_id(SharedString::default());
         c_ui.set_active_error(SharedString::default());
+        c_ui.set_active_dropped(false);
+        c_ui.set_active_latency_ms(-1);
         c_ui.set_selected_terminal_text(SharedString::default());
         c_ui.set_selection_spans(ModelRc::default());
         c_ui.set_selection_dragging(false);
@@ -100,6 +97,7 @@ struct SessionView {
     hide_cursor: bool,
     cursor_shape: i32,
     mouse_mode: i32,
+    mouse_tracking: i32,
     files: ModelRc<FileRow>,
     directory_tree: ModelRc<DirectoryRow>,
     browse_path: SharedString,
@@ -136,6 +134,7 @@ impl SessionView {
             hide_cursor: c_ui.get_hide_cursor(),
             cursor_shape: c_ui.get_cursor_shape(),
             mouse_mode: c_ui.get_mouse_mode(),
+            mouse_tracking: c_ui.get_mouse_tracking(),
             files: c_ui.get_files(),
             directory_tree: c_ui.get_directory_tree(),
             browse_path: c_ui.get_browse_path(),
@@ -175,6 +174,7 @@ impl SessionView {
         c_ui.set_hide_cursor(self.hide_cursor);
         c_ui.set_cursor_shape(self.cursor_shape);
         c_ui.set_mouse_mode(self.mouse_mode);
+        c_ui.set_mouse_tracking(self.mouse_tracking);
         c_ui.set_terminal_runs(self.terminal_runs.clone());
         c_ui.set_files(self.files.clone());
         c_ui.set_directory_tree(self.directory_tree.clone());

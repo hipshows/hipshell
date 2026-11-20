@@ -1,12 +1,12 @@
 use std::{
     collections::HashMap,
     future::Future,
-    sync::{Arc, Mutex, PoisonError},
+    sync::{Arc, LazyLock, Mutex, PoisonError},
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, ensure};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
@@ -26,6 +26,7 @@ type HttpSessions = Arc<Mutex<HashMap<String, (Peer, Instant)>>>;
 static LAST_REQUEST: Mutex<Option<(Instant, u16, bool)>> = Mutex::new(None);
 // 自检请求带此请求头, 不计入最近的外部请求.
 const SELF_CHECK_HEADER: &str = "x-hipshell-self-check";
+static TOOLS: LazyLock<Vec<Value>> = LazyLock::new(definitions);
 
 const MAX_REQUEST: usize = 128 * 1024;
 // 初始化时交给 AI 的使用说明: 按类别介绍工具, 终端与独立执行由用户意图决定, 不预设偏好.
@@ -100,16 +101,15 @@ where
             if c_peer.negotiated {
                 return z_error(z_id, -32600, "MCP 已完成初始化");
             }
-            let l_requested = z_params.get("protocolVersion").and_then(Value::as_str);
-            if l_requested.is_none()
-                || !z_params.get("capabilities").is_some_and(Value::is_object)
-                || !z_params.get("clientInfo").is_some_and(|c| {
-                    c.get("name").is_some_and(Value::is_string) && c.get("version").is_some_and(Value::is_string)
-                })
-            {
+            let Some(l_requested) = z_params.get("protocolVersion").and_then(Value::as_str).filter(|_| {
+                z_params.get("capabilities").is_some_and(Value::is_object)
+                    && z_params.get("clientInfo").is_some_and(|c| {
+                        c.get("name").is_some_and(Value::is_string) && c.get("version").is_some_and(Value::is_string)
+                    })
+            }) else {
                 return z_error(z_id, -32602, "initialize 需要 protocolVersion、capabilities 和 clientInfo");
-            }
-            let l_version = match l_requested.unwrap_or_default() {
+            };
+            let l_version = match l_requested {
                 // 所用工具能力在这些版本中一致, 回应客户端版本, 避免旧客户端因版本不符断开.
                 l_known @ ("2024-11-05" | "2025-03-26" | "2025-06-18" | "2025-11-25") => l_known,
                 _ => "2025-11-25",
@@ -119,21 +119,22 @@ where
             Ok(json!({"protocolVersion":l_version,"capabilities":{"tools":{}},"serverInfo":{"name":"HiPShell","version":env!("CARGO_PKG_VERSION")},"instructions":INSTRUCTIONS}))
         }
         "ping" => Ok(json!({})),
-        "tools/list" if c_peer.initialized => Ok(json!({"tools":definitions()})),
+        "tools/list" if c_peer.initialized => Ok(json!({"tools":&*TOOLS})),
         "tools/call" if c_peer.initialized => {
             let Some(l_name) = z_params.get("name").and_then(Value::as_str) else {
                 return z_error(z_id, -32602, "缺少工具名称");
             };
-            let l_definitions = definitions();
-            let Some(l_definition) = l_definitions.iter().find(|c| c.get("name").and_then(Value::as_str) == Some(l_name)) else {
+            let Some(l_definition) = TOOLS.iter().find(|c| c.get("name").and_then(Value::as_str) == Some(l_name)) else {
                 return z_error(z_id, -32602, "未知工具");
             };
-            let l_args = z_params.get("arguments").cloned().unwrap_or_else(|| json!({}));
-            if !l_args.is_object() {
-                return z_error(z_id, -32602, "工具参数必须是对象");
-            }
+            let l_args = match z_params.get("arguments") {
+                Some(Value::Object(c)) => c.clone(),
+                None => Map::new(),
+                _ => return z_error(z_id, -32602, "工具参数必须是对象"),
+            };
             async {
                 validate_arguments(&l_args, &l_definition["inputSchema"])?;
+                let l_args = Value::Object(l_args);
                 let l_args = if l_name == "write_terminal" { terminal_input(l_args)? } else { l_args };
                 let l_result = c_call(l_name.to_owned(), l_args, c_peer.client.clone()).await?;
                 let l_text = serde_json::to_string(&l_result)?;
@@ -416,6 +417,7 @@ fn local_host(c_host: &str) -> bool {
 // 自检: 按 AI 客户端的方式向本机端口发一次 initialize 再结束会话, 确认在监听、能握手且回应来自本程序;
 // 再结合最近一次外部请求和代理环境变量, 区分"客户端没连到本服务"与"连到了但被拒".
 // 返回 (级别 0 正常 / 1 需注意 / 2 服务不可用, 一句结论, 一句说明或处理办法).
+#[cfg(feature = "desktop")]
 pub(crate) async fn self_check(c_port: u16) -> (i32, String, String) {
     let z_last = LAST_REQUEST.lock().unwrap_or_else(PoisonError::into_inner).clone();
     match tokio::time::timeout(Duration::from_secs(5), check_initialize(c_port)).await {
@@ -450,6 +452,7 @@ pub(crate) async fn self_check(c_port: u16) -> (i32, String, String) {
     }
 }
 
+#[cfg(feature = "desktop")]
 async fn check_initialize(c_port: u16) -> Result<()> {
     let z_body = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"HiPShell 自检","version":env!("CARGO_PKG_VERSION")}}});
     let z_reply = self_request(c_port, "POST", "", &z_body.to_string()).await?;
@@ -467,6 +470,7 @@ async fn check_initialize(c_port: u16) -> Result<()> {
 }
 
 // 向本机端口发一个请求并读完整回复 (服务端回复后即关闭连接).
+#[cfg(feature = "desktop")]
 async fn self_request(c_port: u16, c_method: &str, c_extra: &str, c_body: &str) -> Result<String> {
     let mut z_stream = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, c_port))
         .await
@@ -596,26 +600,23 @@ fn session() -> Value {
     json!({"session_id":string()})
 }
 fn with_session(mut c_fields: Value) -> Value {
-    if let Some(z_object) = c_fields.as_object_mut() {
-        z_object.insert("session_id".into(), string());
-    }
+    c_fields["session_id"] = string();
     c_fields
 }
 fn tool(c_name: &str, c_description: &str, c_properties: Value, c_required: &[&str]) -> Value {
     json!({"name":c_name,"description":c_description,"inputSchema":{"type":"object","properties":c_properties,"required":c_required,"additionalProperties":false}})
 }
 
-fn validate_arguments(c_args: &Value, c_schema: &Value) -> Result<()> {
-    let z_args = c_args.as_object().context("工具参数必须是对象")?;
+fn validate_arguments(c_args: &Map<String, Value>, c_schema: &Value) -> Result<()> {
     let z_fields = c_schema["properties"]
         .as_object()
         .context("工具参数定义无效")?;
     if let Some(z_required) = c_schema["required"].as_array() {
         for l_key in z_required.iter().filter_map(Value::as_str) {
-            ensure!(z_args.contains_key(l_key), "缺少参数: {l_key}");
+            ensure!(c_args.contains_key(l_key), "缺少参数: {l_key}");
         }
     }
-    for (l_key, l_value) in z_args {
+    for (l_key, l_value) in c_args {
         let l_schema = z_fields
             .get(l_key)
             .with_context(|| format!("未知参数: {l_key}"))?;

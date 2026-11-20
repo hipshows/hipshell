@@ -23,8 +23,6 @@ const FILE_CACHE_ROWS: usize = 100_000;
 // 文件列表缓存按文字估算的字节上限 (含目录树隐藏子树另计).
 const FILE_CACHE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_TREE_NODES: usize = 2000;
-// 一次上传或下载最多选择的项数, 每项一个任务, 需小于后端任务队列上限.
-const MAX_TRANSFER_ITEMS: usize = 32;
 // 终端选中复制的上限.
 const MAX_COPY_BYTES: usize = 1024 * 1024;
 // 保存与恢复窗口大小的下限 (逻辑像素), 低于它视为异常 (最小化、错误关闭等).
@@ -243,7 +241,7 @@ pub fn run(
     // 应用开关与端口: 后台立即启停或换端口, 结果回到设置页显示.
     z_ui.on_mcp_apply(move |c_enabled, c_port| {
         let Some(z_ui) = z_weak.upgrade() else { return; };
-        let Some(z_port) = c_port.trim().parse::<u16>().ok().filter(|c| *c >= 1024) else {
+        let Some(z_port) = u16::try_from(c_port).ok().filter(|c| *c >= 1024) else {
             notify(&z_ui, NOTE_ERROR, "端口需在 1024-65535 之间");
             return;
         };
@@ -272,7 +270,7 @@ pub fn run(
     let z_weak = z_ui.as_weak();
     z_ui.on_mcp_self_check(move || {
         let Some(z_ui) = z_weak.upgrade() else { return; };
-        let Ok(z_port) = z_ui.get_mcp_port().parse::<u16>() else { return; };
+        let Ok(z_port) = u16::try_from(z_ui.get_mcp_port()) else { return; };
         z_ui.set_mcp_checking(true);
         let z_weak = z_weak.clone();
         z_runtime.spawn(async move {
@@ -323,9 +321,14 @@ pub fn run(
         });
     });
     let z_font = string(&z_settings, "terminal_font");
-    if !z_font.is_empty() {
-        z_ui.set_terminal_font(z_font.into());
-    }
+    z_ui.set_terminal_font(
+        if z_font.is_empty() {
+            if cfg!(target_os = "macos") { "Menlo" } else { "Consolas" }
+        } else {
+            z_font
+        }
+        .into(),
+    );
     z_ui.set_term_font_size(number(&z_settings, "terminal_font_size").clamp(9.0, 28.0) as f32);
     let z_backend = c_backend.clone();
     let z_runtime = c_runtime.clone();
@@ -334,8 +337,8 @@ pub fn run(
         dispatch(&z_runtime, &z_backend, z_weak.clone(), "set_terminal_font", json!({"family":c_family.as_str(),"size":c_size}));
     });
     z_ui.set_tab_show_group(z_settings.get("tab_show_group").and_then(Value::as_bool).unwrap_or(true));
-    // 未设置或目录已不存在时默认下载到桌面; 用户更改后保存在 settings.json.
-    let z_download_dir = Some(string(&z_settings, "download_dir")).filter(|c| !c.is_empty() && std::path::Path::new(c).is_dir()).map(str::to_owned);
+    // 已保存的目录可能被移除, 保留设置并在下载时创建.
+    let z_download_dir = Some(string(&z_settings, "download_dir")).filter(|c| std::path::Path::new(c).is_absolute()).map(str::to_owned);
     z_ui.set_download_dir(z_download_dir.unwrap_or_else(desktop_dir).into());
     SHOW_GROUP.set(z_ui.get_tab_show_group());
     // 连接管理列宽: 配置中个数不对时用默认; 拖动松开后整组保存.
@@ -361,6 +364,34 @@ pub fn run(
     let z_weak = z_ui.as_weak();
     z_ui.on_terminal_history_changed(move |c_lines| {
         dispatch(&z_runtime, &z_backend, z_weak.clone(), "set_terminal_scrollback", json!({"lines":c_lines}));
+    });
+    let z_concurrency = (number(&z_settings, "transfer_concurrency") as u32).clamp(1, crate::config::MAX_TRANSFER_CONCURRENCY);
+    let z_batch = (number(&z_settings, "transfer_batch") as u32).clamp(1, crate::config::MAX_TRANSFER_BATCH);
+    z_ui.set_transfer_concurrency(z_concurrency as i32);
+    z_ui.set_transfer_batch_limit(z_batch as i32);
+    let (z_limits_tx, mut z_limits_rx) = tokio::sync::watch::channel((z_concurrency, z_batch));
+    let z_weak = z_ui.as_weak();
+    z_ui.on_transfer_limits_changed(move || {
+        let Some(l_ui) = z_weak.upgrade() else { return; };
+        let l_concurrency = (l_ui.get_transfer_concurrency().max(1) as u32).clamp(1, crate::config::MAX_TRANSFER_CONCURRENCY);
+        let l_batch = (l_ui.get_transfer_batch_limit().max(1) as u32).clamp(1, crate::config::MAX_TRANSFER_BATCH);
+        let _ = z_limits_tx.send((l_concurrency, l_batch));
+    });
+    let z_backend = c_backend.clone();
+    let z_weak = z_ui.as_weak();
+    // 合并快速点击或键盘输入后再顺序落盘并调整并发槽位, 避免频繁写配置文件.
+    c_runtime.spawn(async move {
+        while z_limits_rx.changed().await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            let (l_concurrency, l_batch) = *z_limits_rx.borrow_and_update();
+            if let Err(err) = z_backend
+                .call("set_transfer_limits", json!({"concurrency":l_concurrency,"batch":l_batch}), Actor::User)
+                .await
+            {
+                let l_message = format!("传输设置保存失败: {err}");
+                let _ = z_weak.upgrade_in_event_loop(move |c_ui| notify(&c_ui, NOTE_ERROR, l_message));
+            }
+        }
     });
     let z_state = Arc::new(Mutex::new(Value::Null));
     // 已渲染的终端画面: (会话, 序号, 滚动偏移).
@@ -419,6 +450,26 @@ pub fn run(
             .find(|c| string(c, "session_id") == z_active.as_str());
         apply_monitor_processes(&z_ui, z_session);
         apply_monitor_history(&z_ui, z_session);
+    });
+    let z_snapshot = z_state.clone();
+    let z_weak = z_ui.as_weak();
+    z_ui.on_monitor_opened(move || {
+        let Some(z_ui) = z_weak.upgrade() else {
+            return;
+        };
+        let Ok(z_state) = z_snapshot.lock() else {
+            return;
+        };
+        if z_state.is_null() {
+            return;
+        }
+        let z_active = z_ui.get_active_session();
+        let z_session = array(&z_state, "sessions")
+            .iter()
+            .find(|c| string(c, "session_id") == z_active.as_str());
+        apply_mcp_status(&z_ui, &z_state["mcp_status"]);
+        apply_monitor_history(&z_ui, z_session);
+        apply_monitor_processes(&z_ui, z_session);
     });
     let z_answers = Arc::new(Mutex::new(Vec::<String>::new()));
     // 显示分组: 立即按上次状态重建各处服务器名称 (状态没变化时轮询不会重新应用), 再保存设置.
@@ -497,8 +548,9 @@ pub fn run(
             notify(&z_ui, NOTE_ERROR, "无法读取拖拽文件路径");
             return;
         };
+        let z_limit = z_ui.get_transfer_batch_limit().max(1) as usize;
         let z_paths = z_paths
-            .take(MAX_TRANSFER_ITEMS + 1)
+            .take(z_limit + 1)
             .map(std::path::Path::to_path_buf)
             .collect::<Vec<_>>();
         let z_session = z_ui.get_active_session().to_string();
@@ -511,6 +563,7 @@ pub fn run(
             z_link,
             z_ui.get_browse_path().to_string(),
             z_paths,
+            z_limit,
         );
     });
     crate::native_drop::install(&z_ui);
@@ -603,13 +656,24 @@ pub fn run(
     });
     let z_weak = z_ui.as_weak();
     let z_tx = z_input.clone();
-    z_ui.on_terminal_wheel(move |c_lines, c_row, c_col| {
+    z_ui.on_terminal_wheel(move |c_lines, c_row, c_col, c_modifiers| {
         let Some(z_ui) = z_weak.upgrade() else { return false; };
-        let z_data = terminal_wheel(c_lines, c_row, c_col, z_ui.get_mouse_mode(), z_ui.get_application_cursor());
+        let z_data = terminal_wheel(c_lines, c_row, c_col, c_modifiers, z_ui.get_mouse_mode(), z_ui.get_application_cursor());
         if !enqueue_input(&z_tx, z_ui.get_active_session().to_string(), z_data, 0) {
             notify(&z_ui, NOTE_WARN, "终端输入队列已满, 请稍后重试");
         }
         true
+    });
+    let z_weak = z_ui.as_weak();
+    let z_tx = z_input.clone();
+    z_ui.on_terminal_pointer(move |c_code, c_row, c_col, c_release| {
+        let Some(z_ui) = z_weak.upgrade() else { return false; };
+        let z_mode = z_ui.get_mouse_mode();
+        if z_mode == 0 {
+            return false;
+        }
+        let z_data = terminal_mouse(c_code, c_row, c_col, c_release, z_mode);
+        enqueue_input(&z_tx, z_ui.get_active_session().to_string(), z_data, 0)
     });
     let z_weak = z_ui.as_weak();
     let z_tx = z_input.clone();
@@ -866,9 +930,19 @@ pub fn run(
                 z_ui.invoke_terminal_refresh();
                 if let Ok(l_state) = z_view_snapshot.try_lock() {
                     let l_session = array(&l_state, "sessions").iter().find(|c| string(c, "session_id") == z_arg);
+                    z_ui.set_active_latency_ms(
+                        l_session
+                            .filter(|c| string(c, "status") == "connected")
+                            .and_then(|c| c.get("latency_ms"))
+                            .and_then(Value::as_i64)
+                            .map(|c| c.clamp(0, i32::MAX as i64) as i32)
+                            .unwrap_or(-1),
+                    );
                     apply_monitor_usage(&z_ui, l_session);
-                    apply_monitor_history(&z_ui, l_session);
-                    apply_monitor_processes(&z_ui, l_session);
+                    if z_ui.get_monitor_expanded() {
+                        apply_monitor_history(&z_ui, l_session);
+                        apply_monitor_processes(&z_ui, l_session);
+                    }
                 }
             }
             return;
@@ -986,7 +1060,7 @@ pub fn run(
                 ("run_command",json!({"session_id":z_session,"command":z_arg,"timeout_seconds":30,"max_output_bytes":1048576}))
             }
             "get_task" | "cancel_task" => {
-                if c_method=="get_task" { z_ui.set_selected_task(z_arg.clone().into()); }
+                if c_method == "get_task" { z_ui.set_selected_task(z_arg.clone().into()); }
                 (c_method.as_str(),json!({"task_id":z_arg}))
             }
             "list_files" => {
@@ -1129,6 +1203,7 @@ pub fn run(
         let z_listed_link = LISTED_LINK.with_borrow(|c| c.get(&z_session).copied());
         let z_selected_files = z_ui.get_files().iter().filter(|c| c.selected).collect::<Vec<_>>();
         let z_upload_target = z_ui.get_upload_target().to_string();
+        let z_batch_limit = z_ui.get_transfer_batch_limit().max(1) as usize;
         let z_weak = z_weak.clone();
         let z_backend = z_backend.clone();
         z_runtime.spawn(async move {
@@ -1154,27 +1229,32 @@ pub fn run(
                 // 系统对话框不能同时选文件和文件夹 (Windows), 分成两个入口.
                 let z_paths = if z_kind == "upload" { z_dialog.pick_files().await } else { z_dialog.pick_folders().await };
                 if let Some(z_paths) = z_paths {
-                    upload_paths(&tokio::runtime::Handle::current(), &z_backend, z_weak, z_session, z_listed_link, z_upload_target, z_paths.into_iter().take(MAX_TRANSFER_ITEMS + 1).map(|c| c.path().to_path_buf()).collect());
+                    upload_paths(&tokio::runtime::Handle::current(), &z_backend, z_weak, z_session, z_listed_link, z_upload_target, z_paths.into_iter().take(z_batch_limit + 1).map(|c| c.path().to_path_buf()).collect(), z_batch_limit);
                 }
                 return;
             }
             if matches!(z_kind.as_str(), "download" | "download_to") {
-                if z_selected_files.is_empty() || z_selected_files.len() > MAX_TRANSFER_ITEMS {
-                    show_notice(z_weak, NOTE_WARN, format!("一次请选择 1～{MAX_TRANSFER_ITEMS} 项下载")); return;
+                if z_selected_files.is_empty() || z_selected_files.len() > z_batch_limit {
+                    show_notice(z_weak, NOTE_WARN, format!("一次请选择 1～{z_batch_limit} 项下载")); return;
                 }
                 if z_selected_files.iter().any(|c| c.name.is_empty() || c.name == "." || c.name == ".." || c.name.contains('/') || c.name.chars().any(char::is_control)) {
                     show_notice(z_weak, NOTE_WARN, "下载项的名称不能包含路径或控制字符".into()); return;
                 }
-                // "下载" 直接存入下载目录 (默认桌面), 目录已不存在时退回选择位置; "下载到…" 总是选择位置.
+                // "下载" 使用默认目录, "下载到…" 由系统对话框选择位置.
                 let z_default = (z_kind == "download" && !z_download_dir.is_empty())
-                    .then(|| std::path::PathBuf::from(&z_download_dir))
-                    .filter(|c| c.is_dir());
+                    .then(|| std::path::PathBuf::from(&z_download_dir));
                 // 直接存入下载目录且达到 3 项时先确认目录; "下载到…" 刚选过位置, 不再确认.
-                if z_default.is_some() && z_selected_files.len() >= 3 &&!confirm_download(z_weak.clone(), z_selected_files.len()).await { return; }
+                if z_default.is_some() && z_selected_files.len() >= 3 && !confirm_download(z_weak.clone(), z_selected_files.len()).await { return; }
                 // 文件夹、多选和默认目录都存到目录下, 只有单个文件用另存为.
                 let z_multiple = z_default.is_some() || z_selected_files.len() > 1 || z_selected_files[0].directory;
                 let z_destination = match z_default {
-                    Some(l_dir) => l_dir,
+                    Some(l_dir) => {
+                        if let Err(err) = tokio::fs::create_dir_all(&l_dir).await {
+                            show_notice(z_weak, NOTE_ERROR, format!("创建下载目录失败: {} ({err})", l_dir.display()));
+                            return;
+                        }
+                        l_dir
+                    }
                     None => {
                         let l_picked = if z_multiple {
                             z_dialog.set_title("选择下载保存目录").pick_folder().await
@@ -1354,9 +1434,8 @@ pub fn run(
             // 终端可显示的列数与行数, 随窗口变化并同步给服务器.
             z_ui.set_terminal_size_text(format!("{} 列 · {} 行", z_size.2, z_size.1).into());
             *z_dimensions.borrow_mut() = z_size.clone();
-            if z_scroll == 0 {
-                z_sequence.lock().unwrap().0.clear();
-            }
+            // 无论是否在翻看历史, 尺寸变化后都需要刷新一次视图与展示尺寸.
+            z_sequence.lock().unwrap().0.clear();
         }
         let (z_after_seq, z_read_view) = {
             let z_rendered = z_sequence.lock().unwrap();
@@ -1377,6 +1456,43 @@ pub fn run(
             z_busy.store(false, Ordering::Release);
             return;
         }
+        let mut z_args = json!({"session_id":z_session,"max_lines":200,"scroll_offset":z_scroll});
+        if z_selection || !z_read_view { z_args["events_only"] = json!(true); }
+        if let Some(z_seq) = z_after_seq {
+            z_args["after_seq"] = json!(z_seq);
+        }
+        if z_resize
+            && let Some(l_terminal) = c_backend.try_resize_and_read_terminal(
+                &z_session,
+                Some((z_size.1.clamp(1, 200) as u16, z_size.2.clamp(1, 400) as u16)),
+                &z_args,
+            )
+        {
+            match l_terminal {
+                Ok(l_value) => {
+                    if let Some(l_text) = l_value.get("clipboard").and_then(Value::as_str) {
+                        z_ui.invoke_copy_text(l_text.into());
+                    }
+                    if let (Some(l_rows), Some(l_cols)) = (l_value.get("rows").and_then(Value::as_i64), l_value.get("cols").and_then(Value::as_i64))
+                        && (l_rows, l_cols) != (i64::from(z_size.1.clamp(1, 200)), i64::from(z_size.2.clamp(1, 400)))
+                    {
+                        z_resize_failed.store(true, Ordering::Release);
+                    }
+                    apply_polled_terminal(&z_ui, &l_value, &z_session, z_scroll, &z_sequence);
+                }
+                Err(_) => {
+                    z_resize_failed.store(true, Ordering::Release);
+                }
+            }
+            z_busy.store(false, Ordering::Release);
+            if z_rerun.swap(false, Ordering::AcqRel) {
+                let l_weak = z_weak.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(l_ui) = l_weak.upgrade() { l_ui.invoke_terminal_refresh(); }
+                });
+            }
+            return;
+        }
         let z_backend = c_backend.clone();
         let z_weak = z_weak.clone();
         let z_busy = z_busy.clone();
@@ -1386,34 +1502,26 @@ pub fn run(
         let z_resize_failed = z_resize_failed.clone();
         c_runtime.spawn(async move {
             // 后台调用放进子任务: 万一 panic, 这里仍能释放忙标志, 画面刷新不会就此停住.
-            let z_calls = {
-                let z_session = z_session.clone();
-                tokio::spawn(async move {
-                    if z_resize
-                        && z_backend
-                            .call("resize_terminal", json!({"session_id":z_size.0,"rows":z_size.1,"cols":z_size.2}), Actor::User)
-                            .await
-                            .is_err()
-                    {
-                        z_resize_failed.store(true, Ordering::Release);
-                    }
-                    let mut z_args = json!({"session_id":z_session,"max_lines":200,"scroll_offset":z_scroll});
-                    if z_selection || !z_read_view { z_args["events_only"] = json!(true); }
-                    if let Some(z_seq) = z_after_seq {
-                        z_args["after_seq"] = json!(z_seq);
-                    }
-                    let z_terminal = z_backend.call("read_terminal", z_args, Actor::User).await;
-                    // 后台终端尺寸与界面不符 (同标签重连后新会话沿用了旧尺寸、调整落到了旧会话等) 时重新同步; 比较前按后台上限截取.
-                    // 轻量结果 (拖选、翻看历史) 也带尺寸, 同样能发现.
-                    if let Ok(l_value) = &z_terminal
-                        && let (Some(l_rows), Some(l_cols)) = (l_value.get("rows").and_then(Value::as_i64), l_value.get("cols").and_then(Value::as_i64))
-                        && (l_rows, l_cols) != (i64::from(z_size.1.clamp(1, 200)), i64::from(z_size.2.clamp(1, 400)))
-                    {
-                        z_resize_failed.store(true, Ordering::Release);
-                    }
-                    z_terminal
-                })
-            };
+            let z_calls = tokio::spawn(async move {
+                if z_resize
+                    && z_backend
+                        .call("resize_terminal", json!({"session_id":z_size.0,"rows":z_size.1,"cols":z_size.2}), Actor::User)
+                        .await
+                        .is_err()
+                {
+                    z_resize_failed.store(true, Ordering::Release);
+                }
+                let z_terminal = z_backend.call("read_terminal", z_args, Actor::User).await;
+                // 后台终端尺寸与界面不符 (同标签重连后新会话沿用了旧尺寸、调整落到了旧会话等) 时重新同步; 比较前按后台上限截取.
+                // 轻量结果 (拖选、翻看历史) 也带尺寸, 同样能发现.
+                if let Ok(l_value) = &z_terminal
+                    && let (Some(l_rows), Some(l_cols)) = (l_value.get("rows").and_then(Value::as_i64), l_value.get("cols").and_then(Value::as_i64))
+                    && (l_rows, l_cols) != (i64::from(z_size.1.clamp(1, 200)), i64::from(z_size.2.clamp(1, 400)))
+                {
+                    z_resize_failed.store(true, Ordering::Release);
+                }
+                z_terminal
+            });
             let Ok(z_terminal) = z_calls.await else {
                 z_busy.store(false, Ordering::Release);
                 return;
@@ -1554,7 +1662,11 @@ fn apply_polled_state(
             return;
         }
     };
-    apply_mcp_status(c_ui, &z_value["mcp_status"]);
+    if c_ui.get_monitor_expanded() {
+        apply_mcp_status(c_ui, &z_value["mcp_status"]);
+    } else {
+        c_ui.set_mcp_running(boolean(&z_value["mcp_status"], "running"));
+    }
     let mut z_old = c_state.lock().unwrap();
     let z_active_connected = array(&z_value, "sessions").iter().any(|c| string(c, "session_id") == c_ui.get_active_session().as_str() && string(c, "status") == "connected");
     let z_needs_files = if z_active_connected {
@@ -1668,6 +1780,7 @@ fn apply_polled_terminal(
         c_ui.set_application_cursor(boolean(c_value, "application_cursor"));
         c_ui.set_modified_keys(number(c_value, "modified_keys") as i32);
         c_ui.set_mouse_mode(number(c_value, "mouse") as i32);
+        c_ui.set_mouse_tracking(number(c_value, "mouse_tracking") as i32);
     }
     if c_ui.get_terminal_scroll_offset() != c_scroll
         || boolean(c_value, "unchanged")
@@ -1873,7 +1986,7 @@ fn select_terminal_text(
     c_ui.set_selection_spans(ModelRc::new(VecModel::from(z_spans)));
     c_ui.set_selected_terminal_text(z_selected.into());
     if z_truncated {
-        notify(c_ui, NOTE_WARN, "所选文本最多复制 64 KB, 请分段复制");
+        notify(c_ui, NOTE_WARN, "所选文本最多复制 1 MB, 请分段复制");
     }
 }
 
@@ -1959,9 +2072,10 @@ fn upload_paths(
     c_link: Option<u64>,
     c_directory: String,
     c_paths: Vec<std::path::PathBuf>,
+    c_limit: usize,
 ) {
-    if c_paths.is_empty() || c_paths.len() > MAX_TRANSFER_ITEMS {
-        show_notice(c_weak, NOTE_WARN, format!("一次请选择或拖入 1～{MAX_TRANSFER_ITEMS} 项"));
+    if c_paths.is_empty() || c_paths.len() > c_limit {
+        show_notice(c_weak, NOTE_WARN, format!("一次请选择或拖入 1～{c_limit} 项"));
         return;
     }
     let z_backend = c_backend.clone();
@@ -1994,14 +2108,35 @@ fn upload_paths(
                 z_seen.insert(z_name.clone());
             }
         }
-        // 只查最终名称是否已存在 (并发查询), 不读整个目录; 同名冲突统一询问一次.
-        // 检查失败时按无冲突处理: 任务不带覆盖许可, 由后台再次检查, 不会覆盖.
+        // 只查最终名称是否已存在 (并发查询, 最多等待 6 秒), 不读整个目录; 超时/失败时若目标目录命中界面缓存则回退用缓存文件名提示冲突.
+        // 任务仍不带覆盖许可, 由后台再次严格检查防误覆盖.
         show_notice(c_weak.clone(), NOTE_INFO, "正在检查目标目录中的同名文件...".into());
-        let mut z_taken = z_backend
-            .call("check_remote_names", json!({"session_id":c_session,"_link":c_link,"directory":c_directory,"names":z_names}), Actor::User)
-            .await
-            .map(|c| array(&c, "existing").iter().filter_map(Value::as_str).map(str::to_owned).collect::<std::collections::HashSet<_>>())
-            .unwrap_or_default();
+        let z_check = tokio::time::timeout(
+            Duration::from_secs(6),
+            z_backend.call("check_remote_names", json!({"session_id":c_session,"_link":c_link,"directory":c_directory,"names":z_names}), Actor::User),
+        )
+        .await;
+        let mut z_taken = match z_check {
+            Ok(Ok(l_value)) => array(&l_value, "existing").iter().filter_map(Value::as_str).map(str::to_owned).collect::<std::collections::HashSet<_>>(),
+            _ => {
+                let (l_tx, l_rx) = tokio::sync::oneshot::channel();
+                let (l_sess, l_dir) = (c_session.clone(), c_directory.clone());
+                if c_weak.upgrade_in_event_loop(move |c_ui| {
+                    let l_names = if let Some((l_rows, _)) = cached_file_rows(&l_sess, &l_dir) {
+                        l_rows.into_iter().map(|c| c.name.to_string()).collect()
+                    } else if c_ui.get_active_session().as_str() == l_sess && c_ui.get_browse_path().as_str() == l_dir && c_ui.get_remote_ready() {
+                        c_ui.get_files().iter().map(|c| c.name.to_string()).collect()
+                    } else {
+                        Vec::new()
+                    };
+                    let _ = l_tx.send(l_names);
+                }).is_ok() {
+                    l_rx.await.unwrap_or_default().into_iter().collect()
+                } else {
+                    std::collections::HashSet::new()
+                }
+            }
+        };
         let z_conflicts = z_names.iter().filter(|c| z_taken.contains(*c)).cloned().collect::<Vec<_>>();
         // 覆盖许可按文件记录: 只有确认框里列出的目标可以覆盖.
         let mut z_overwrite = vec![false; z_names.len()];
@@ -2020,8 +2155,11 @@ fn upload_paths(
                     }
                 }
                 ConflictChoice::KeepBoth => {
-                    // 保留两者时新名字也不能与已有文件重名: 此时才读取完整目录; 读取失败时仍由后台拒绝重名.
-                    if let Ok(l_list) = z_backend.call("list_files", json!({"session_id":c_session,"_link":c_link,"path":c_directory}), Actor::User).await {
+                    // 保留两者时新名字也不能与已有文件重名: 此时才读取完整目录; 读取失败或超时时仍由后台拒绝重名.
+                    if let Ok(Ok(l_list)) = tokio::time::timeout(
+                        Duration::from_secs(6),
+                        z_backend.call("list_files", json!({"session_id":c_session,"_link":c_link,"path":c_directory}), Actor::User),
+                    ).await {
                         z_taken.extend(array(&l_list, "entries").iter().map(|l| string(l, "name").to_owned()));
                     }
                     for z_name in &mut z_names {
@@ -2186,15 +2324,17 @@ fn refresh_directory_children(c_ui: &AppWindow, c_path: &str, c_entries: &[Value
     let z_end = z_nodes.iter().enumerate().skip(z_index + 1)
         .find(|(_, c)| c.depth < z_depth).map(|(i, _)| i).unwrap_or(z_nodes.len());
     let z_previous = z_nodes.drain(z_index + 1..z_end).collect::<Vec<_>>();
+    let mut z_previous_by_path = HashMap::new();
+    for l_subtree in z_previous.chunk_by(|_, c| c.depth > z_depth) {
+        z_previous_by_path.entry(l_subtree[0].path.as_str()).or_insert(l_subtree);
+    }
     let z_available = MAX_TREE_NODES.saturating_sub(z_nodes.len());
     let mut z_children = Vec::new();
     for z_entry in c_entries.iter().filter(|c| boolean(c, "is_dir")) {
         if z_children.len() >= z_available { break; }
         let z_path = format!("{}/{}", c_path.trim_end_matches('/'), string(z_entry, "name"));
-        if let Some(z_old_index) = z_previous.iter().position(|c| c.path.as_str() == z_path && c.depth == z_depth) {
-            let z_old_end = z_previous.iter().enumerate().skip(z_old_index + 1)
-                .find(|(_, c)| c.depth <= z_depth).map(|(i, _)| i).unwrap_or(z_previous.len());
-            z_children.extend(z_previous[z_old_index..z_old_end].iter().take(z_available - z_children.len()).cloned());
+        if let Some(l_subtree) = z_previous_by_path.get(z_path.as_str()) {
+            z_children.extend(l_subtree.iter().take(z_available - z_children.len()).cloned());
         } else {
             z_children.push(DirectoryRow { path: z_path.into(), name: string(z_entry, "name").into(), depth: z_depth, expanded: false });
         }
@@ -2248,10 +2388,10 @@ fn complete(c_weak: slint::Weak<AppWindow>, c_method: String, c_result: anyhow::
                 // 浏览、连接、轮询等由界面本身体现结果, 不再逐条提示“完成”.
                 if !matches!(
                     c_method.as_str(),
-                    "list_files" | "file_details" | "get_task" | "connect" | "reconnect" | "new_tab" | "focus_session" | "disconnect"
+                    "list_files" | "file_details" | "get_task" | "cancel_task" | "connect" | "reconnect" | "new_tab" | "focus_session" | "disconnect"
                         | "open_terminal" | "close_terminal" | "trust_host" | "answer_auth" | "run_command"
                         | "upload_file" | "download_file" | "upload_directory" | "download_directory" | "send_command" | "send_saved_command" | "export_finalshell" | "copy_file"
-                        | "import_finalshell" | "set_terminal_scrollback" | "import_commands" | "export_commands" | "move_tab" | "set_expanded_groups" | "set_tab_show_group" | "set_connection_columns"
+                        | "import_finalshell" | "set_terminal_scrollback" | "set_transfer_limits" | "import_commands" | "export_commands" | "move_tab" | "set_expanded_groups" | "set_tab_show_group" | "set_connection_columns"
                 ) {
                     notify(&z_ui, NOTE_OK, format!("{}完成", method_label(&c_method)));
                 }
@@ -2301,16 +2441,36 @@ fn complete(c_weak: slint::Weak<AppWindow>, c_method: String, c_result: anyhow::
                             return;
                         }
                         if let Some(z_id) = z_value.get("session_id").and_then(Value::as_str) {
+                            let z_empty = boolean(&z_value, "empty");
                             if c_method != "focus_session" {
                                 let mut z_sessions = z_ui.get_sessions().iter().collect::<Vec<_>>();
-                                if !z_sessions.iter().any(|c| c.id.as_str() == z_id) {
-                                    z_sessions.push(SessionRow { id: z_id.into(), label: if boolean(&z_value, "empty") { "快速连接".into() } else { "连接中".into() }, empty: boolean(&z_value, "empty"), ..Default::default() });
+                                if let Some(l_row) = z_sessions.iter_mut().find(|c| c.id.as_str() == z_id) {
+                                    l_row.empty = z_empty;
+                                    if !z_empty {
+                                        l_row.state = 1;
+                                    }
+                                    z_ui.set_sessions(update_rows(z_ui.get_sessions(), z_sessions));
+                                } else {
+                                    z_sessions.push(SessionRow {
+                                        id: z_id.into(),
+                                        label: if z_empty { "快速连接".into() } else { "连接中".into() },
+                                        empty: z_empty,
+                                        state: if z_empty { 0 } else { 1 },
+                                        ..Default::default()
+                                    });
                                     z_ui.set_sessions(update_rows(z_ui.get_sessions(), z_sessions));
                                 }
                             }
                             z_ui.invoke_action("show_session".into(), z_id.into());
                             if c_method != "focus_session" {
-                                z_ui.set_active_session_empty(boolean(&z_value, "empty"));
+                                z_ui.set_active_session_empty(z_empty);
+                                if !z_empty {
+                                    z_ui.set_active_connected(false);
+                                    z_ui.set_active_latency_ms(-1);
+                                    z_ui.set_active_state(1);
+                                    z_ui.set_active_error(SharedString::default());
+                                    z_ui.set_active_dropped(false);
+                                }
                                 z_ui.set_managing(false);
                                 // 复用空白标签时 show_session 不会重新激活, 且激活时仍按空标签禁用输入; 状态更新后再交还焦点.
                                 z_ui.invoke_restore_terminal_view();
@@ -2717,11 +2877,27 @@ fn apply_state(c_ui: &AppWindow, c_state: &Value, c_answers: &Arc<Mutex<Vec<Stri
     let z_session = array(c_state, "sessions")
         .iter()
         .find(|c_item| string(c_item, "session_id") == z_active.as_str());
+    let z_raw_status = z_session.map(|c| string(c, "status")).unwrap_or_default();
+    let z_state_code = z_session.map(session_state).unwrap_or(0);
+    let z_err = session_error(z_raw_status);
     c_ui.set_active_session_empty(z_session.is_none_or(|c| boolean(c, "empty")));
-    c_ui.set_active_connected(z_session.is_some_and(|c| string(c, "status") == "connected"));
-    c_ui.set_active_state(z_session.map(session_state).unwrap_or(0));
+    c_ui.set_active_connected(z_raw_status == "connected");
+    c_ui.set_active_state(z_state_code);
+    c_ui.set_active_dropped(z_raw_status.starts_with("error: 连接已断开:"));
     c_ui.set_active_connection_id(z_session.map(|c| string(c, "connection_id")).unwrap_or_default().into());
-    c_ui.set_active_error(session_error(z_session.map(|c| string(c, "status")).unwrap_or_default()).into());
+    c_ui.set_active_latency_ms(
+        z_session
+            .filter(|c| string(c, "status") == "connected")
+            .and_then(|c| c.get("latency_ms"))
+            .and_then(Value::as_i64)
+            .map(|c| c.clamp(0, i32::MAX as i64) as i32)
+            .unwrap_or(-1),
+    );
+    if z_state_code == 3 && z_err.is_empty() && c_ui.get_terminal_text().starts_with("终端打开失败:") {
+        c_ui.set_active_error(c_ui.get_terminal_text().trim().into());
+    } else {
+        c_ui.set_active_error(z_err.into());
+    }
     c_ui.set_peer_status(
         z_session
             .map(|c| {
@@ -2747,8 +2923,10 @@ fn apply_state(c_ui: &AppWindow, c_state: &Value, c_answers: &Arc<Mutex<Vec<Stri
             .unwrap_or_else(|| "尚未连接".into())
             .into(),
     );
-    apply_monitor_history(c_ui, z_session);
-    apply_monitor_processes(c_ui, z_session);
+    if c_ui.get_monitor_expanded() {
+        apply_monitor_history(c_ui, z_session);
+        apply_monitor_processes(c_ui, z_session);
+    }
     apply_monitor_usage(c_ui, z_session);
     c_ui.set_quick_commands(update_rows(c_ui.get_quick_commands(),
         array(c_state, "quick_commands")
@@ -2774,17 +2952,20 @@ fn apply_state(c_ui: &AppWindow, c_state: &Value, c_answers: &Arc<Mutex<Vec<Stri
             notify(c_ui, NOTE_ERROR, l_text);
         }
     }
+    let z_tasks = array(c_state, "tasks");
+    let z_task_connections = array(c_state, "connections").iter().map(|c| (string(c, "id"), c)).collect::<HashMap<_, _>>();
     c_ui.set_tasks(update_rows(c_ui.get_tasks(),
-        array(c_state, "tasks")
+        z_tasks
             .iter()
             .map(|c_item| {
                 let l_total = number(c_item, "total");
                 let l_bytes = number(c_item, "bytes");
                 let l_status = string(c_item, "status");
-                let l_connection = array(c_state, "connections")
-                    .iter()
-                    .find(|c| string(c, "id") == string(c_item, "connection_id"));
+                let l_connection = z_task_connections.get(string(c_item, "connection_id")).copied();
                 let l_machine = l_connection.map(server_label).unwrap_or_else(|| "连接已删除".into());
+                let l_ratio = if l_total > 0.0 { (l_bytes / l_total).clamp(0.0, 1.0) } else { -1.0 };
+                let l_pct = l_ratio.max(0.0) * 100.0;
+                let l_speed = number(c_item, "speed_bytes_per_sec");
                 let l_command = string(c_item, "kind") == "command";
                 let l_exit = c_item.get("exit_code").and_then(Value::as_i64);
                 let l_directory = boolean(c_item, "directory");
@@ -2821,63 +3002,46 @@ fn apply_state(c_ui: &AppWindow, c_state: &Value, c_answers: &Arc<Mutex<Vec<Stri
                         _ => status_label(l_status).to_string(),
                     }
                     .into(),
-                    detail: if l_command {
-                        SharedString::default()
-                    } else if l_status == "completed" {
-                        format!(
-                            "{}{}{} · {}",
-                            if l_directory { format!("{l_files} 个文件 · ") } else { String::new() },
+                    detail: match l_status {
+                        _ if l_command => SharedString::default(),
+                        "completed" => format!(
+                            "{}{}{}",
+                            if l_directory { format!("{l_files:.0} 个文件 · ") } else { String::new() },
                             format_bytes(l_bytes),
-                            if string(c_item, "stderr").is_empty() { "" } else { " · 有跳过项, 见详情" },
-                            task_timing(c_item).unwrap_or_default(),
-                        )
-                        .into()
-                    } else if l_directory && l_status == "preparing" && l_files == 0.0 {
-                        "正在扫描文件夹".into()
-                    } else if l_directory && l_status == "running" {
-                        // 进度条为当前文件; 整个文件夹的进度放在末尾.
-                        format!(
-                            "{:.0}/{l_files} {} · {} / {} · {}/s · 总 {:.0}%",
+                            if string(c_item, "stderr").is_empty() { "" } else { " · 有跳过项" },
+                        ).into(),
+                        "queued" | "preparing" if l_directory && l_files == 0.0 => SharedString::default(),
+                        "queued" | "preparing" if l_directory =>
+                            format!("{l_files:.0} 个文件{}", if l_total > 0.0 { format!(" · {}", format_bytes(l_total)) } else { String::new() }).into(),
+                        "queued" | "preparing" if l_total > 0.0 => format_bytes(l_total).into(),
+                        "running" if l_directory => format!(
+                            "{:.0}/{l_files:.0} · {}{l_pct:.0}%",
                             (number(c_item, "files_done") + 1.0).min(l_files),
-                            string(c_item, "current"),
-                            format_bytes(l_file_bytes),
-                            format_bytes(l_file_total),
-                            format_bytes(number(c_item, "speed_bytes_per_sec")),
-                            if l_total > 0.0 { (l_bytes / l_total).clamp(0.0, 1.0) * 100.0 } else { 0.0 },
-                        )
-                        .into()
-                    } else if l_status == "retrying" {
-                        format!(
-                            "已保留 {}{} · 等待自动重连",
-                            format_bytes(l_bytes),
-                            if l_total > 0.0 { format!(" / {}", format_bytes(l_total)) } else { String::new() },
-                        )
-                        .into()
-                    } else {
-                        let l_speed = number(c_item, "speed_bytes_per_sec");
-                        format!(
-                            "{}{} · {}/s{}",
-                            format_bytes(l_bytes),
-                            if l_total > 0.0 { format!(" / {}", format_bytes(l_total)) } else { String::new() },
-                            format_bytes(l_speed),
-                            if l_status == "running" && l_speed > 0.0 && l_total > l_bytes { format!(" · 剩 {}", format_eta((l_total - l_bytes) / l_speed)) } else { String::new() },
-                        )
-                        .into()
+                            if l_speed > 0.0 { format!("{}/s · ", format_bytes(l_speed)) } else { String::new() },
+                        ).into(),
+                        "retrying" if l_total > 0.0 => format!("{l_pct:.0}%").into(),
+                        "retrying" if l_bytes > 0.0 => format_bytes(l_bytes).into(),
+                        "running" if l_speed > 0.0 && l_total > l_bytes =>
+                            format!("{l_pct:.0}% · {}/s · 剩 {}", format_bytes(l_speed), format_eta((l_total - l_bytes) / l_speed)).into(),
+                        "running" if l_total > 0.0 => format!("{l_pct:.0}% · {}", format_bytes(l_total)).into(),
+                        "running" if l_speed > 0.0 => format!("{} · {}/s", format_bytes(l_bytes), format_bytes(l_speed)).into(),
+                        "running" => format_bytes(l_bytes).into(),
+                        _ => SharedString::default(),
                     },
                     ratio: if l_directory {
                         if l_status == "running" && l_file_total > 0.0 { (l_file_bytes / l_file_total).clamp(0.0, 1.0) as f32 } else { -1.0 }
-                    } else if l_command || l_total <= 0.0 {
+                    } else if l_command {
                         -1.0
                     } else {
-                        (l_bytes / l_total).clamp(0.0, 1.0) as f32
+                        l_ratio as f32
                     },
-                    cancellable: matches!(l_status, "queued" | "preparing" | "running" | "pending" | "retrying"),
+                    cancellable: task_active(l_status),
                     local: string(c_item, "local").into(),
                 }
             })
             .collect::<Vec<_>>(),
     ));
-    apply_transfer_summary(c_ui, array(c_state, "tasks"));
+    apply_transfer_summary(c_ui, z_tasks, &z_task_connections);
     let z_trust = array(c_state, "sessions")
         .iter()
         .find(|c_item| c_item.get("trust").is_some_and(Value::is_object));
@@ -3053,13 +3217,22 @@ fn apply_connection_tree(c_ui: &AppWindow) {
 }
 
 fn apply_terminal(c_ui: &AppWindow, c_value: &Value) {
+    let z_text = string(c_value, "text");
     c_ui.set_bracketed_paste(boolean(c_value, "bracketed_paste"));
     c_ui.set_application_cursor(boolean(c_value, "application_cursor"));
     c_ui.set_modified_keys(number(c_value, "modified_keys") as i32);
     c_ui.set_hide_cursor(boolean(c_value, "hide_cursor"));
     c_ui.set_cursor_shape(number(c_value, "cursor_shape") as i32);
     c_ui.set_mouse_mode(number(c_value, "mouse") as i32);
-    c_ui.set_terminal_text(string(c_value, "text").into());
+    c_ui.set_mouse_tracking(number(c_value, "mouse_tracking") as i32);
+    c_ui.set_terminal_text(z_text.into());
+    if c_ui.get_active_state() == 3 {
+        if z_text.starts_with("终端打开失败:") {
+            c_ui.set_active_error(z_text.trim().into());
+        } else {
+            c_ui.set_active_error(SharedString::default());
+        }
+    }
     c_ui.set_terminal_view_offset(number(c_value, "scroll_offset") as i32);
     c_ui.set_terminal_history_lines(number(c_value, "scrollback_lines") as i32);
     c_ui.set_cursor_row(number(c_value, "cursor_row") as i32);
@@ -3318,14 +3491,16 @@ fn status_label(c_status: &str) -> &str {
         "authenticating" => "认证中",
         "authentication_failed" => "认证失败",
         "disconnected" => "已断开",
-        "queued" | "pending" => "排队中",
+        "queued" => "排队中",
         "preparing" => "准备中",
         "running" => "进行中",
         "retrying" => "等待恢复",
+        "cancelling" => "正在取消",
         "completed" => "已完成",
         "cancelled" => "已取消",
         "failed" => "失败",
         // 具体原因由状态栏左侧消息和终端区提示显示, 标签与会话状态只给简短状态.
+        _ if c_status.starts_with("error: 连接已断开:") => "已断开",
         _ if c_status.starts_with("error") => "连接失败",
         _ => c_status,
     }
@@ -3335,7 +3510,10 @@ fn status_label(c_status: &str) -> &str {
 fn session_error(c_status: &str) -> String {
     match c_status {
         "authentication_failed" => "服务器拒绝了密码或私钥, 请检查凭据".into(),
-        _ => c_status.strip_prefix("error: ").unwrap_or_default().into(),
+        _ => {
+            let l_msg = c_status.strip_prefix("error: ").unwrap_or_default();
+            l_msg.strip_prefix("连接已断开: ").unwrap_or(l_msg).into()
+        }
     }
 }
 
@@ -3406,44 +3584,68 @@ fn apply_monitor_usage(c_ui: &AppWindow, c_session: Option<&Value>) {
 
 // 顶栏传输按钮与传输面板: 按钮显示进行中的上传/下载数、合计进度和失败标记; 面板列出未清除的传输任务.
 // 用户新发起的传输自动打开面板, AI (MCP) 发起的只在列表和按钮上显示, 不打断用户.
-fn apply_transfer_summary(c_ui: &AppWindow, c_tasks: &[Value]) {
-    let z_transfers = c_tasks.iter().filter(|c| matches!(string(c, "kind"), "upload" | "download")).collect::<Vec<_>>();
-    let z_running = z_transfers
-        .iter()
-        .filter(|c| matches!(string(c, "status"), "queued" | "preparing" | "running" | "pending" | "retrying"))
-        .collect::<Vec<_>>();
+fn apply_transfer_summary(c_ui: &AppWindow, c_tasks: &[Value], c_connections: &HashMap<&str, &Value>) {
+    let mut z_names = HashMap::new();
+    // 每个方向依次累计任务数、已传字节、已知总量和正在传输的速度.
+    let mut z_totals = [(0, 0.0, 0.0, None); 2];
     let z_new_user = TRANSFER_SEEN.with_borrow_mut(|c_seen| {
-        let l_new = z_running.iter().any(|c| string(c, "source") != "mcp" && !c_seen.contains(string(c, "task_id")));
-        // 只保留后台仍在的任务, 两个集合不随历史无限增长.
-        *c_seen = z_transfers.iter().map(|c| string(c, "task_id").to_owned()).collect();
+        let l_previous = std::mem::take(c_seen);
+        let mut l_new = false;
+        for l_task in c_tasks {
+            let i = match string(l_task, "kind") { "upload" => 0, "download" => 1, _ => continue };
+            let l_id = string(l_task, "task_id");
+            c_seen.insert(l_id.to_owned());
+            // 传输面板只显示纯连接名称, 避免分组前缀挤掉主机名.
+            if let Some(l_connection) = c_connections.get(string(l_task, "connection_id")) {
+                z_names.insert(l_id, string(l_connection, "name"));
+            }
+            let l_status = string(l_task, "status");
+            if !task_active(l_status) {
+                continue;
+            }
+            l_new |= string(l_task, "source") != "mcp" && !l_previous.contains(l_id);
+            let (l_count, l_bytes, l_total, l_speed) = &mut z_totals[i];
+            *l_count += 1;
+            let l_size = number(l_task, "total");
+            if l_size > 0.0 {
+                *l_bytes += number(l_task, "bytes");
+                *l_total += l_size;
+            }
+            if l_status == "running" {
+                *l_speed.get_or_insert(0.0) += number(l_task, "speed_bytes_per_sec");
+            }
+        }
         TRANSFER_CLEARED.with_borrow_mut(|c| c.retain(|l| c_seen.contains(l)));
         l_new
     });
-    let z_rows = TRANSFER_CLEARED.with_borrow(|c_cleared| {
+    let mut z_rows = TRANSFER_CLEARED.with_borrow(|c_cleared| {
         c_ui.get_tasks().iter().filter(|c| c.kind != 0 && !c_cleared.contains(c.id.as_str())).collect::<Vec<_>>()
     });
+    for l_row in &mut z_rows {
+        if let Some(l_name) = z_names.get(l_row.id.as_str()) {
+            l_row.server = (*l_name).into();
+        }
+    }
     c_ui.set_transfer_failed(z_rows.iter().any(|c| c.state == 2));
     c_ui.set_transfers(update_rows(c_ui.get_transfers(), z_rows));
-    let z_uploads = z_running.iter().filter(|c| string(c, "kind") == "upload").collect::<Vec<_>>();
-    c_ui.set_transfer_uploads(z_uploads.len() as i32);
-    c_ui.set_transfer_downloads((z_running.len() - z_uploads.len()) as i32);
-    // 各方向合计进度只算大小已知的任务; 该方向无任务或都未知时为 -1, 按钮不显示该方向的进度条.
-    let z_progress = |c_kind: &str| {
-        let (l_bytes, l_total) = z_running.iter().filter(|c| string(c, "kind") == c_kind && number(c, "total") > 0.0)
-            .fold((0.0, 0.0), |c, l| (c.0 + number(l, "bytes"), c.1 + number(l, "total")));
-        if l_total > 0.0 { (l_bytes / l_total).clamp(0.0, 1.0) as f32 } else { -1.0 }
+    let [(z_up_count, z_up_bytes, z_up_total, z_up_speed), (z_down_count, z_down_bytes, z_down_total, z_down_speed)] = z_totals;
+    let z_progress = |c_bytes: f64, c_total: f64| {
+        if c_total > 0.0 { (c_bytes / c_total).clamp(0.0, 1.0) as f32 } else { -1.0 }
     };
-    c_ui.set_transfer_up_progress(z_progress("upload"));
-    c_ui.set_transfer_down_progress(z_progress("download"));
-    let z_speed = |c_kind: &str| {
-        let l_running = z_running.iter().filter(|c| string(c, "kind") == c_kind && string(c, "status") == "running").collect::<Vec<_>>();
-        if l_running.is_empty() { SharedString::default() } else { format!("{}/s", format_bytes(l_running.iter().map(|c| number(c, "speed_bytes_per_sec")).sum::<f64>())).into() }
-    };
-    c_ui.set_transfer_up_speed(z_speed("upload"));
-    c_ui.set_transfer_down_speed(z_speed("download"));
+    let z_speed = |c_speed: Option<f64>| c_speed.map(|c| format!("{}/s", format_bytes(c)).into()).unwrap_or_default();
+    c_ui.set_transfer_uploads(z_up_count);
+    c_ui.set_transfer_downloads(z_down_count);
+    c_ui.set_transfer_up_progress(z_progress(z_up_bytes, z_up_total));
+    c_ui.set_transfer_down_progress(z_progress(z_down_bytes, z_down_total));
+    c_ui.set_transfer_up_speed(z_speed(z_up_speed));
+    c_ui.set_transfer_down_speed(z_speed(z_down_speed));
     if z_new_user {
         c_ui.set_transfers_open(true);
     }
+}
+
+fn task_active(c_status: &str) -> bool {
+    matches!(c_status, "queued" | "preparing" | "running" | "retrying")
 }
 
 // 默认下载目录: 用户目录下的桌面, 没有桌面时用用户目录. Windows 开启 OneDrive 备份后桌面在 %OneDrive%\Desktop,
@@ -3459,9 +3661,9 @@ fn desktop_dir() -> String {
 fn format_eta(c_seconds: f64) -> String {
     let z_seconds = c_seconds.ceil().min(359_999.0) as u64;
     match z_seconds {
-        0..60 => format!("{z_seconds} 秒"),
-        60..3600 => format!("{} 分 {} 秒", z_seconds / 60, z_seconds % 60),
-        _ => format!("{} 小时 {} 分", z_seconds / 3600, z_seconds % 3600 / 60),
+        0..60 => format!("{z_seconds}秒"),
+        60..3600 => format!("{}分{}秒", z_seconds / 60, z_seconds % 60),
+        _ => format!("{}小时{}分", z_seconds / 3600, z_seconds % 3600 / 60),
     }
 }
 
@@ -3506,7 +3708,9 @@ fn terminal_key(
     c_modified_keys: i32,
 ) -> Option<String> {
     use slint::platform::Key;
-    let z_key = |c_key: Key| *c_text == SharedString::from(c_key);
+    let mut z_chars = c_text.chars();
+    let z_char = z_chars.next().filter(|_| z_chars.next().is_none())?;
+    let z_key = |c_key: Key| z_char == char::from(c_key);
     let z_modifier = 1 + i32::from(c_shift) + i32::from(c_alt) * 2 + i32::from(c_control) * 4;
     // 第 3 位为 Kitty 键盘协议 (Pi、Codex 等开启), 带修饰的按键统一编码为 CSI 码 u, 可区分 Shift+Enter 等组合.
     let z_kitty = c_modified_keys & 4 != 0;
@@ -3524,10 +3728,9 @@ fn terminal_key(
     }
     // 组合键产生的普通字符按文字输入: Windows 的 AltGr 即 Ctrl+Alt (如 @ { €), macOS 的 Option 用于输入特殊字符.
     // Slint 的方向键、功能键位于私用区, 不受影响.
-    let z_printable = c_text.chars().count() == 1
-        && c_text.chars().all(|c| !c.is_control() && !('\u{e000}'..='\u{f8ff}').contains(&c));
+    let z_printable = !z_char.is_control() && !('\u{e000}'..='\u{f8ff}').contains(&z_char);
     if z_printable && c_alt && !z_extended {
-        if cfg!(windows) && c_control && !c_text.chars().all(|c| c.is_ascii_alphanumeric()) {
+        if cfg!(windows) && c_control && !z_char.is_ascii_alphanumeric() {
             return None;
         }
         if cfg!(target_os = "macos") && !c_control {
@@ -3543,13 +3746,7 @@ fn terminal_key(
         (Key::End, "F"),
     ] {
         if z_key(z_arrow) {
-            if z_modifier == 1
-                && c_application_cursor
-                && matches!(
-                    z_arrow,
-                    Key::UpArrow | Key::DownArrow | Key::RightArrow | Key::LeftArrow
-                )
-            {
+            if z_modifier == 1 && c_application_cursor {
                 return Some(format!("\u{1b}O{z_code}"));
             }
             return Some(if z_modifier == 1 {
@@ -3589,7 +3786,7 @@ fn terminal_key(
     ] {
         if z_key(z_key_value) {
             // F1-F4 为 SS3 P-S, 带修饰时按 xterm 写作 CSI 1;修饰 P-S.
-            let z_letter = char::from_u32((z_code - 11) as u32 + 'P' as u32)?;
+            let z_letter = char::from(b'P' + (z_code - 11) as u8);
             return Some(if z_code <= 14 && z_modifier == 1 {
                 format!("\u{1b}O{z_letter}")
             } else if z_code <= 14 {
@@ -3623,7 +3820,7 @@ fn terminal_key(
         return Some(if z_extended { format!("\u{1b}[27;{z_modifier};9~") }
             else { if c_shift { "\u{1b}[Z" } else { "\t" }.into() });
     }
-    if z_key(Key::Return) || c_text.as_str() == "\r" || c_text.as_str() == "\n" {
+    if z_key(Key::Return) || matches!(z_char, '\r' | '\n') {
         if z_kitty && z_modifier > 1 {
             return z_kitty_code(13);
         }
@@ -3632,70 +3829,63 @@ fn terminal_key(
             format!("\u{1b}[27;{z_modifier};13~")
         } else if c_alt { "\u{1b}\r".into() } else if c_control { "\n".into() } else { "\r".into() });
     }
-    if z_kitty && (c_control || c_alt) && c_text.chars().count() == 1 {
+    if z_kitty && (c_control || c_alt) {
         // Kitty 协议用未按 Shift 的键值, Shift 已在修饰位中; 符号按美式键位还原 (如 Ctrl+Shift+/ 的 ? 还原为 /).
-        return c_text.chars().next().and_then(|c| {
-            let l_base = if c_shift {
-                "~!@#$%^&*()_+{}|:\"<>?".find(c).map(|i| "`1234567890-=[]\\;',./".as_bytes()[i] as char).unwrap_or(c)
-            } else { c };
-            z_kitty_code(l_base.to_ascii_lowercase() as u32)
-        });
+        let l_base = if c_shift {
+            "~!@#$%^&*()_+{}|:\"<>?".find(z_char).map(|i| "`1234567890-=[]\\;',./".as_bytes()[i] as char).unwrap_or(z_char)
+        } else { z_char };
+        return z_kitty_code(l_base.to_ascii_lowercase() as u32);
     }
-    if z_extended && c_text.chars().count() == 1 {
-        return c_text.chars().next().map(|c| format!("\u{1b}[27;{z_modifier};{}~", c as u32));
+    if z_extended {
+        return Some(format!("\u{1b}[27;{z_modifier};{}~", z_char as u32));
     }
     if c_control {
         if c_shift && c_text.eq_ignore_ascii_case("v") {
             return None;
         }
-        if let Some(z_char) = c_text
-            .chars()
-            .next()
-            .filter(|_| c_text.chars().count() == 1)
-        {
-            let z_ascii = z_char.to_ascii_uppercase() as u32;
-            if (64..=95).contains(&z_ascii) {
-                return Some(char::from_u32(z_ascii & 31)?.to_string());
-            }
-            // xterm 对数字和 / 的传统映射: Ctrl+2 为 NUL, Ctrl+3..7 为 ESC..US, Ctrl+8 为 DEL, Ctrl+/ 同 Ctrl+_.
-            let z_code = match z_char {
-                ' ' | '2' => Some(0x00),
-                '3' => Some(0x1b),
-                '4' => Some(0x1c),
-                '5' => Some(0x1d),
-                '6' => Some(0x1e),
-                '7' | '/' => Some(0x1f),
-                '8' => Some(0x7f),
-                _ => None,
-            };
-            if let Some(z_code) = z_code {
-                return Some(char::from(z_code).to_string());
-            }
+        let l_ascii = z_char.to_ascii_uppercase() as u32;
+        if (64..=95).contains(&l_ascii) {
+            return Some(char::from((l_ascii & 31) as u8).to_string());
+        }
+        // xterm 对数字和 / 的传统映射: Ctrl+2 为 NUL, Ctrl+3..7 为 ESC..US, Ctrl+8 为 DEL, Ctrl+/ 同 Ctrl+_.
+        let l_code = match z_char {
+            ' ' | '2' => Some(0x00),
+            '3' => Some(0x1b),
+            '4' => Some(0x1c),
+            '5' => Some(0x1d),
+            '6' => Some(0x1e),
+            '7' | '/' => Some(0x1f),
+            '8' => Some(0x7f),
+            _ => None,
+        };
+        if let Some(l_code) = l_code {
+            return Some(char::from(l_code).to_string());
         }
     }
-    if c_alt && c_text.chars().count() == 1 {
-        return Some(format!("\u{1b}{c_text}"));
-    }
-    None
+    c_alt.then(|| format!("\u{1b}{z_char}"))
 }
 
 // 滚轮: 远端开启鼠标上报时发送滚轮事件 (tmux、vim mouse=a 等), 否则在全屏程序中按方向键滚动 (less、man 等).
-fn terminal_wheel(c_lines: i32, c_row: i32, c_col: i32, c_mouse_mode: i32, c_application_cursor: bool) -> String {
+fn terminal_wheel(c_lines: i32, c_row: i32, c_col: i32, c_modifiers: i32, c_mouse_mode: i32, c_application_cursor: bool) -> String {
     let z_up = c_lines > 0;
     let z_count = c_lines.unsigned_abs().min(10) as usize;
-    let z_button = if z_up { 64 } else { 65 };
-    let z_event = match c_mouse_mode {
-        2 => format!("\u{1b}[<{z_button};{};{}M", c_col + 1, c_row + 1),
-        // 传统编码每个坐标占一个字节; 只发 ASCII, 坐标超过 95 时取最大值.
-        1 => format!(
-            "\u{1b}[M{}{}{}",
-            char::from(32 + z_button as u8),
-            char::from(33 + c_col.clamp(0, 94) as u8),
-            char::from(33 + c_row.clamp(0, 94) as u8)
-        ),
-        _ => format!("\u{1b}{}{}", if c_application_cursor { 'O' } else { '[' }, if z_up { 'A' } else { 'B' }),
+    let z_event = if c_mouse_mode != 0 {
+        terminal_mouse(if z_up { 64 } else { 65 } | c_modifiers, c_row, c_col, false, c_mouse_mode)
+    } else {
+        format!("\u{1b}{}{}", if c_application_cursor { 'O' } else { '[' }, if z_up { 'A' } else { 'B' })
     };
     z_event.repeat(z_count)
+}
+
+fn terminal_mouse(c_code: i32, c_row: i32, c_col: i32, c_release: bool, c_mode: i32) -> String {
+    if c_mode == 2 {
+        return format!("\u{1b}[<{c_code};{};{}{}", c_col + 1, c_row + 1, if c_release { 'm' } else { 'M' });
+    }
+    // 传统格式用按钮 3 表示释放; ASCII 输入队列以 95 格为界. UTF-8 扩展允许更长的坐标.
+    let z_code = if c_release { c_code | 3 } else { c_code };
+    let z_limit = if c_mode == 3 { 2014 } else { 94 };
+    let z_coord = |c_value: i32| char::from_u32(33 + c_value.clamp(0, z_limit) as u32).unwrap();
+    format!("\u{1b}[M{}{}{}", char::from(32 + z_code as u8), z_coord(c_col), z_coord(c_row))
 }
 
 fn apply_monitor_history(c_ui: &AppWindow, c_session: Option<&Value>) {
@@ -3861,6 +4051,10 @@ fn task_output(c_ui: &AppWindow, c_task: &Value) -> String {
                 let _ = writeln!(z_output, "当前  {}", string(c_task, "current"));
             }
         }
+        let l_retries = number(c_task, "transfer_retries");
+        if l_retries > 0.0 {
+            let _ = writeln!(z_output, "自动重试  {l_retries:.0} 次");
+        }
         if string(c_task, "status") == "retrying" {
             z_output.push_str("正在自动重连, 恢复后从已保留进度继续; 可取消任务.\n");
         }
@@ -3873,6 +4067,9 @@ fn task_output(c_ui: &AppWindow, c_task: &Value) -> String {
     };
     z_section("输出", string(c_task, "stdout"));
     z_section(if z_code == Some(0) { "提示输出" } else { "错误输出" }, string(c_task, "stderr"));
+    if string(c_task, "last_transfer_error") != string(c_task, "error") {
+        z_section("最近一次重试原因", string(c_task, "last_transfer_error"));
+    }
     z_section(if string(c_task, "status") == "retrying" { "恢复原因" } else { "错误" }, string(c_task, "error"));
     if z_kind == "command" && matches!(string(c_task, "status"), "completed") && string(c_task, "stdout").is_empty() && string(c_task, "stderr").is_empty() {
         z_output.push_str("\n(无输出)\n");
@@ -3995,6 +4192,7 @@ fn method_label(c_method: &str) -> &str {
         "focus_session" => "切换标签",
         "set_terminal_font" => "保存终端字体",
         "set_terminal_scrollback" => "保存历史行数",
+        "set_transfer_limits" => "保存传输设置",
         "set_tab_show_group" => "保存标签分组显示",
         "set_download_dir" => "设置下载目录",
         "set_connection_columns" => "保存列宽",
@@ -4209,8 +4407,8 @@ async fn terminal_input_worker(
 // MCP 设置页: 开关、端口草稿与运行状态; 运行中时生成网址、JSON 配置和交给 AI 的安装说明.
 fn apply_mcp_settings(c_ui: &AppWindow, c_enabled: bool, c_port: u64, c_status: &std::result::Result<String, String>) {
     c_ui.set_mcp_enabled(c_enabled);
-    c_ui.set_mcp_port(c_port.to_string().into());
-    c_ui.set_mcp_port_draft(c_port.to_string().into());
+    c_ui.set_mcp_port(c_port as i32);
+    c_ui.set_mcp_port_draft(c_port as i32);
     // 开关或端口变了, 旧的自检结果不再适用.
     c_ui.set_mcp_check_title("".into());
     let Ok(z_url) = c_status else {

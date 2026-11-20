@@ -2,7 +2,7 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    io::{Read, Write},
+    io::Read,
     path::{Path, PathBuf},
     sync::Mutex,
 };
@@ -301,27 +301,7 @@ impl CommandStore {
     fn write(&self, c_data: &CommandData) -> Result<()> {
         let z_bytes = serde_json::to_vec(c_data)?;
         ensure!(z_bytes.len() <= MAX_FILE_BYTES, "命令配置超过 1 MiB");
-        let z_temp = self
-            .path
-            .with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
-        let z_result = (|| -> Result<()> {
-            let mut z_options = fs::OpenOptions::new();
-            z_options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                z_options.mode(0o600);
-            }
-            let mut z_file = z_options.open(&z_temp)?;
-            z_file.write_all(&z_bytes)?;
-            z_file.sync_all()?;
-            drop(z_file);
-            fs::rename(&z_temp, &self.path).context("保存常用命令失败")
-        })();
-        if z_result.is_err() {
-            let _ = fs::remove_file(&z_temp);
-        }
-        z_result
+        crate::config::write_bytes_atomic(&self.path, &z_bytes).context("保存常用命令失败")
     }
 }
 
