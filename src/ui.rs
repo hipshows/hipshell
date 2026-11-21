@@ -2999,6 +2999,9 @@ fn apply_state(c_ui: &AppWindow, c_state: &Value, c_answers: &Arc<Mutex<Vec<Stri
                     },
                     status: match l_exit {
                         Some(l_code) if l_command => format!("{} · 退出码 {l_code}", status_label(l_status)),
+                        _ if !l_command && l_status == "running" && boolean(c_item, "main_link") => {
+                            format!("{} · 主连接", status_label(l_status))
+                        }
                         _ => status_label(l_status).to_string(),
                     }
                     .into(),

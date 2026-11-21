@@ -36,9 +36,11 @@ fn run() -> Result<()> {
     attach_console(&z_args);
     // 唯一配置目录: macOS 在 Application Support, Windows 为程序旁的 config.
     let z_dir = ConfigStore::default_directory()?;
+    // 按 CPU 核数有界分配异步线程, 阻塞线程池与最大并发传输数对齐 (按需创建、空闲回收), 避免多文件传输和本地扫描互相排队.
+    let z_workers = std::thread::available_parallelism().map_or(4, |c| c.get().clamp(2, 4));
     let z_runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .max_blocking_threads(4)
+        .worker_threads(z_workers)
+        .max_blocking_threads(16)
         .enable_all()
         .build()?;
     if z_args.first().is_some_and(|c| c == "--version") {

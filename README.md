@@ -2,72 +2,85 @@
 
 [中文](README.zh-CN.md) | English
 
-**One shell, shared by you and your AI.**
+A lightweight SSH client for macOS and Windows built with Rust and Slint, with a built-in local MCP server.
 
-HiPShell is a lightweight SSH client (Rust + Slint, macOS / Windows) with a built-in MCP server. An LLM agent (Claude Code, Codex, ...) works in the **same live terminal** you are looking at: you see every command it types, it sees what you did, and either of you can take over at any time.
+Most AI + SSH tools open a separate background session that you cannot see. HiPShell lets an agent (Claude Code, Codex, etc.) work in the same terminal tab you already have open. You can watch every command it runs, step in at any time, and share whatever state is already in that shell (working directory, `sudo -i`, virtualenvs, tmux).
 
-> ⚠️ Most of this code was written by LLMs. It may contain bugs. Review it and use at your own risk.
+![HiPShell screenshot](assets/screenshot.png)
 
-## Why
+Note: most of the code in this repo was written with LLMs. Review it before relying on it and use it at your own risk.
 
-Usual AI + SSH setups give the model its own hidden connection. HiPShell does the opposite:
+## Working with AI
 
-- **Shared session** – the agent types into your terminal tab; current directory, `sudo -i`, virtualenvs, tmux all carry over.
-- **You stay in control** – human input wins; the agent asks before clearing a half-typed command.
-- **Passwords never reach the LLM** – `sudo`/`su` prompts are filled by HiPShell itself (`input_admin_password`).
-- **Per-connection authorization** – the agent only sees servers you allow; it cannot grant itself access, trust new hosts, or read credentials.
-- **Nothing to install on servers** – MCP runs locally at `127.0.0.1`, only local requests accepted.
+- The agent reads and writes directly in your open terminal tab, or runs non-interactive commands on a separate channel (`run_command`) without touching your prompt.
+- Manual input takes priority. If you start typing, queued agent input stops; if you left a half-typed command on the line, the agent is instructed to ask before clearing it.
+- When `sudo` or `su` asks for a password, HiPShell fills the connection's saved admin password directly (`input_admin_password`) so the password never passes through the LLM.
+- MCP access is opt-in per connection. Unlisted servers stay hidden, and the agent cannot grant itself access, trust new host keys, or read stored credentials.
+- The MCP server binds to `127.0.0.1` and only accepts local requests. Nothing needs to be installed on your remote hosts.
 
 ## Features
 
-- Password / private key (OpenSSH, PEM, PuTTY `.ppk`) / keyboard-interactive auth, SOCKS5 / HTTP proxy, legacy algorithms
-- Full VT terminal: vim, tmux, mouse, Kitty keyboard protocol, OSC 52 clipboard
-- SFTP browser, drag & drop upload, resumable transfers with progress
-- Linux monitor: CPU, memory, processes, network
-- Saved command groups, background command execution, task list
-- Reads and writes **FinalShell** connection configs (import / export)
-- Single portable binary, no database
+- Password, private key (OpenSSH, PEM, PuTTY `.ppk`), and keyboard-interactive auth; SOCKS5 / HTTP proxy; legacy algorithm support for older servers.
+- Full VT terminal with vim, tmux, mouse support, Kitty keyboard protocol, and OSC 52 clipboard.
+- SFTP file browser with drag-and-drop upload, resumable transfers, and a transfer queue.
+- Linux resource monitor (CPU, memory, processes, network).
+- Saved command groups, separate background command execution, and a task list.
+- Import and export for FinalShell connection configs.
+- Single portable binary, no external database.
 
-## MCP
+## MCP setup
 
-Start HiPShell, enable MCP for a connection (Edit connection), then register once in your agent:
+Start HiPShell, enable MCP on the connections you want to share (under Edit Connection), then add the local endpoint to your agent:
 
 ```json
-{"mcpServers":{"hipshell":{"type":"http","url":"http://127.0.0.1:7391/mcp"}}}
+{
+  "mcpServers": {
+    "hipshell": {
+      "type": "http",
+      "url": "http://127.0.0.1:7391/mcp"
+    }
+  }
+}
 ```
 
-Claude Code: `claude mcp add --transport http --scope user hipshell http://127.0.0.1:7391/mcp`
+For Claude Code:
+
+```sh
+claude mcp add --transport http --scope user hipshell http://127.0.0.1:7391/mcp
+```
+
+You can change the port or turn MCP off in **Settings → MCP**. To run without a window, use `hipssh --serve`.
+
+Available tools:
 
 | Group | Tools |
 |---|---|
-| Connection | `state` `connect` `reconnect` `open_terminal` `disconnect` |
-| Terminal | `read_terminal` `write_terminal` `input_admin_password` |
-| Command | `run_command` (separate channel, does not touch your terminal) |
-| Files | `list_files` `list_local_files` `upload_file` `download_file` |
-| Tasks | `get_task` `cancel_task` |
-
-Port and on/off switch are in Settings → MCP. Headless mode: `hipssh --serve`.
+| Connection | `state`, `connect`, `reconnect`, `open_terminal`, `disconnect` |
+| Terminal | `read_terminal`, `write_terminal`, `input_admin_password` |
+| Command | `run_command` |
+| Files | `list_files`, `list_local_files`, `upload_file`, `download_file` |
+| Tasks | `get_task`, `cancel_task` |
 
 ## Build
 
-Requires Rust (stable).
+Requires stable Rust.
 
 ```sh
-cargo build --release          # binary: target/release/hipssh
-sh run-macos.sh                # macOS: build .dmg into dist/, and a windows-build/ source copy
+cargo build --release          # binary at target/release/hipssh
+sh run-macos.sh                # macOS: builds .dmg into dist/ and prepares windows-build/
 ```
 
-Windows: copy `windows-build/` to a Windows machine with Visual Studio Build Tools (C++ desktop) and run `build.bat`. See [packaging/windows/README.md](packaging/windows/README.md).
+On Windows, copy `windows-build/` to a machine with Visual Studio Build Tools ("Desktop development with C++") and run `build.bat`. See [packaging/windows/README.md](packaging/windows/README.md) for details.
 
-## Data
+## Data directory
 
 - macOS: `~/Library/Application Support/HiPShell`
-- Windows: `config\` next to the exe (portable)
+- Windows: `config\` next to `hipssh.exe`
 
-Saved passwords use FinalShell-compatible encryption, which is **reversible**. Protect this folder.
+Saved passwords use FinalShell-compatible encryption, which is reversible. Protect this directory accordingly.
 
 ## License
 
-[MIT](LICENSE) – use, modify, and redistribute freely, including commercially.
+[MIT](LICENSE)
 
-Credits: icons from [Lucide](https://lucide.dev) (ISC); FinalShell password compatibility based on [MeatShell](https://github.com/yituorou/meatshell) (MIT / Apache-2.0).
+Icons from [Lucide](https://lucide.dev) (ISC). FinalShell password compatibility is based on [MeatShell](https://github.com/yituorou/meatshell) (MIT / Apache-2.0).

@@ -1,6 +1,6 @@
 [package]
 name = "hipssh"
-version = "1.6.0"
+version = "1.7.0"
 authors = ["HiPsHoW"]
 edition = "2024"
 description = "GUI 与 MCP 共用后台的轻量 SSH 客户端"
