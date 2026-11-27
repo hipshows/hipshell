@@ -83,14 +83,17 @@ fn run() -> Result<()> {
         let z_url = z_mcp.map_err(anyhow::Error::msg)?;
         eprintln!("HiPShell 后台已启动, MCP 网址: {z_url}");
         z_runtime.block_on(tokio::signal::ctrl_c())?;
+        z_runtime.block_on(z_backend.stop_mcp());
         return Ok(());
     }
     #[cfg(feature = "desktop")]
     {
         let z_result = hipssh::ui::run(
-            z_backend,
+            z_backend.clone(),
             z_runtime.handle().clone(),
         );
+        // 退出时先中止 MCP 监听任务立即释放端口, 再限时收尾其余后台任务.
+        z_runtime.block_on(z_backend.stop_mcp());
         // 窗口关闭即退出: 直接丢弃运行时会无限等待仍在执行的阻塞任务 (卡住的 DNS 解析、本地文件读写),
         // 进程留在后台; 最多等 1 秒, 余下的随进程结束.
         z_runtime.shutdown_timeout(Duration::from_secs(1));

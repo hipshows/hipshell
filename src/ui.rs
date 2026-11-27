@@ -1,4 +1,8 @@
-use crate::{backend::{Backend, local_file_name, local_name_key}, model::Actor};
+use crate::{
+    backend::{Backend, local_file_name, local_name_key},
+    i18n::{self, is_en, localize_error as friendly_error, t},
+    model::Actor,
+};
 use serde_json::{Value, json};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use std::{
@@ -6,7 +10,7 @@ use std::{
     collections::HashMap,
     rc::Rc,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, PoisonError,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -38,12 +42,16 @@ thread_local! {
     static TREE_REQUEST: Cell<u64> = const { Cell::new(0) };
     // 刚上传完成的 (会话, 路径): 列表刷新后选中并定位; 批量上传时后完成的覆盖先完成的.
     static FILE_FOCUS: RefCell<Option<(String, String)>> = const { RefCell::new(None) };
+    // 批量上传节流期间暂存的待补刷目录 ((会话, 路径); 路径为空表示整会话失效), 在在途列表回包或同目录上传结束后补刷.
+    static PENDING_UPLOAD_REFRESH: RefCell<std::collections::HashSet<(String, String)>> = RefCell::default();
     static CONFLICT_ANSWER: RefCell<Option<tokio::sync::oneshot::Sender<i32>>> = const { RefCell::new(None) };
     // 设置 → 外观 "显示分组": 服务器名称前是否加 [分组], 标签、快速连接、状态栏、任务等处统一.
     static SHOW_GROUP: Cell<bool> = const { Cell::new(true) };
     // 已见过的传输任务 (新出现的用户任务自动打开传输面板) 与面板中已清除的任务.
     static TRANSFER_SEEN: RefCell<std::collections::HashSet<String>> = RefCell::default();
     static TRANSFER_CLEARED: RefCell<std::collections::HashSet<String>> = RefCell::default();
+    // 上次格式化任务完成时间时的本地日期 (年, 月, 日); 跨午夜时触发重绘, 当天任务随之补上月日.
+    static LAST_LOCAL_DAY: Cell<(i32, u32, u32)> = const { Cell::new((0, 0, 0)) };
     // 认证弹窗当前对应的后台请求标识, 提交回答时带回核对.
     static AUTH_REQUEST: RefCell<String> = RefCell::default();
     // 各会话当前所展示文件列表所属连接的代次: 对列表中的文件发起操作时带上, 后台据此拒绝已重连标签上的旧操作.
@@ -123,6 +131,9 @@ fn invalidate_dirs(c_ui: &AppWindow, c_session: &str, c_dirs: &[String]) {
 }
 
 fn parent_dir(c_path: &str) -> String {
+    if !c_path.starts_with('/') {
+        return String::new();
+    }
     match c_path.trim_end_matches('/').rsplit_once('/') {
         Some(("", _)) | None => "/".into(),
         Some((l_parent, _)) => l_parent.into(),
@@ -151,9 +162,53 @@ fn cache_file_rows(c_ui: &AppWindow) {
     });
 }
 
+pub(crate) fn localize_file_time_label(c_label: &str) -> &'static str {
+    match c_label {
+        "修改时间 (UTC)" | "Modified (UTC)" => t("修改时间 (UTC)", "Modified (UTC)"),
+        "修改时间 (服务器)" | "Modified (Server)" => t("修改时间 (服务器)", "Modified (Server)"),
+        _ => t("修改时间", "Modified"),
+    }
+}
+
+fn localize_file_kind(c_kind: &str) -> &'static str {
+    match c_kind {
+        "文件夹" | "Folder" => t("文件夹", "Folder"),
+        "链接" | "Link" => t("链接", "Link"),
+        _ => t("文件", "File"),
+    }
+}
+
+pub(crate) fn localize_file_rows(c_rows: impl IntoIterator<Item = FileRow>) -> Vec<FileRow> {
+    c_rows
+        .into_iter()
+        .map(|mut l_row| {
+            let l_kind = localize_file_kind(l_row.kind_text.as_str());
+            if l_row.kind_text.as_str() != l_kind {
+                l_row.kind_text = l_kind.into();
+                l_row.label = format!("{l_kind} {} {}", l_row.name, l_row.size_text).into();
+            }
+            l_row
+        })
+        .collect()
+}
+
+fn format_terminal_size(c_cols: i32, c_rows: i32) -> String {
+    if is_en() {
+        format!("{c_cols} × {c_rows}")
+    } else {
+        format!("{c_cols} 列 · {c_rows} 行")
+    }
+}
+
+// MCP 自检代次: 切换语言或修改端口/开关时自增, 避免在途旧结果回写覆盖最新状态.
+static MCP_CHECK_GEN: AtomicU64 = AtomicU64::new(0);
+
 fn cached_file_rows(c_session: &str, c_path: &str) -> Option<(Vec<FileRow>, SharedString)> {
     FILE_CACHE.with_borrow(|c_cache| {
-        c_cache.iter().find(|c| c.0.0 == c_session && c.0.1 == c_path).map(|c| (c.1.clone(), c.2.clone()))
+        c_cache
+            .iter()
+            .find(|c| c.0.0 == c_session && c.0.1 == c_path)
+            .map(|c| (localize_file_rows(c.1.iter().cloned()), localize_file_time_label(c.2.as_str()).into()))
     })
 }
 
@@ -168,6 +223,9 @@ pub fn run(
     // 对外显示主次版本, 如 Ver.1.0; 版本号只在 Cargo.toml 维护.
     z_ui.set_app_version(concat!("Ver.", env!("CARGO_PKG_VERSION_MAJOR"), ".", env!("CARGO_PKG_VERSION_MINOR")).into());
     let z_settings = c_runtime.block_on(c_backend.call("get_settings", json!({}), Actor::User))?;
+    let z_lang = i18n::from_code(string(&z_settings, "language"));
+    i18n::set(z_lang);
+    z_ui.set_language_index(z_lang as i32);
     let z_dark = z_settings
         .get("dark_theme")
         .and_then(Value::as_bool)
@@ -175,6 +233,11 @@ pub fn run(
     z_ui.set_theme_index(if z_dark { 0 } else { 1 });
     z_ui.set_is_macos(cfg!(target_os = "macos"));
     restore_layout(&z_ui, z_settings.get("layout").unwrap_or(&Value::Null));
+    // 启动时同步把恢复后的监控侧栏展开状态告知后台 (监控仅在展开时运行), 避免异步无序到达.
+    {
+        let _l_guard = c_runtime.enter();
+        c_backend.set_monitor_enabled(z_ui.get_monitor_expanded());
+    }
     // 恢复默认布局 (面板已在界面复位): 取消最大化, 窗口回到默认大小并在当前显示器居中, 保存的布局清为默认.
     let (z_backend, z_runtime, z_weak) = (c_backend.clone(), c_runtime.clone(), z_ui.as_weak());
     z_ui.on_reset_window(move || {
@@ -193,8 +256,12 @@ pub fn run(
         // 分组展开状态不属于窗口布局, 恢复默认时保留.
         let z_default = json!({"width":0,"height":0,"maximized":false,"monitor_expanded":false,"monitor_width":260,"bottom_collapsed":true,"bottom_height":232,"bottom_page":0,"expanded_groups":current_expanded_groups(&z_ui)});
         match z_runtime.block_on(z_backend.call("set_layout", json!({"layout": z_default}), Actor::User)) {
-            Ok(_) => notify(&z_ui, NOTE_OK, "已恢复默认布局"),
-            Err(err) => notify(&z_ui, NOTE_ERROR, format!("保存布局失败: {err:#}")),
+            Ok(_) => notify(&z_ui, NOTE_OK, t("已恢复默认布局", "Layout reset to defaults")),
+            Err(err) => notify(
+                &z_ui,
+                NOTE_ERROR,
+                if is_en() { format!("Failed to save layout: {err:#}") } else { format!("保存布局失败: {err:#}") },
+            ),
         }
     });
     // 关闭窗口先确认, 确认后保存窗口位置大小与面板布局 (下次启动恢复) 再退出.
@@ -208,17 +275,18 @@ pub fn run(
         if !z_asking.swap(true, Ordering::AcqRel) {
             let (l_backend, l_runtime, l_weak, l_saved, l_asking) = (z_backend.clone(), z_runtime.clone(), z_weak.clone(), z_saved_flag.clone(), z_asking.clone());
             z_runtime.spawn(async move {
-                let l_answer = rfd::AsyncMessageDialog::new()
-                    .set_title("退出 HiPShell")
-                    .set_level(rfd::MessageLevel::Info)
-                    .set_description("确定退出 HiPShell? 所有连接会断开, 正在进行的传输和命令会中止.")
-                    .set_buttons(rfd::MessageButtons::OkCancelCustom("退出".into(), "取消".into()))
-                    .show()
-                    .await;
+                let l_ok = confirm_dialog(
+                    t("退出 HiPShell", "Quit HiPShell"),
+                    t(
+                        "确定退出 HiPShell? 所有连接会断开, 正在进行的传输和命令会中止.",
+                        "Quit HiPShell? All sessions will disconnect and active transfers or commands will stop.",
+                    ),
+                    rfd::MessageLevel::Info,
+                    t("退出", "Quit"),
+                )
+                .await;
                 l_asking.store(false, Ordering::Release);
-                if matches!(l_answer, rfd::MessageDialogResult::Ok | rfd::MessageDialogResult::Yes)
-                    || matches!(&l_answer, rfd::MessageDialogResult::Custom(c) if c == "退出")
-                {
+                if l_ok {
                     let _ = l_weak.upgrade_in_event_loop(move |c_ui| {
                         save_layout(&c_ui, &l_runtime, &l_backend);
                         l_saved.store(true, Ordering::Release);
@@ -242,7 +310,7 @@ pub fn run(
     z_ui.on_mcp_apply(move |c_enabled, c_port| {
         let Some(z_ui) = z_weak.upgrade() else { return; };
         let Some(z_port) = u16::try_from(c_port).ok().filter(|c| *c >= 1024) else {
-            notify(&z_ui, NOTE_ERROR, "端口需在 1024-65535 之间");
+            notify(&z_ui, NOTE_ERROR, t("端口需在 1024-65535 之间", "Port must be between 1024 and 65535"));
             return;
         };
         let (z_backend, z_weak) = (z_backend.clone(), z_weak.clone());
@@ -252,15 +320,15 @@ pub fn run(
                 let z_status = match z_result {
                     Ok(l_status) => l_status,
                     Err(err) => {
-                        notify(&c_ui, NOTE_ERROR, format!("{err:#}"));
+                        notify(&c_ui, NOTE_ERROR, friendly_error(&format!("{err:#}")));
                         return;
                     }
                 };
                 apply_mcp_settings(&c_ui, c_enabled, u64::from(z_port), &z_status);
                 match &z_status {
-                    Ok(_) => notify(&c_ui, NOTE_OK, "MCP 服务已启动"),
-                    Err(_) if !c_enabled => notify(&c_ui, NOTE_OK, "MCP 服务已关闭"),
-                    Err(err) => notify(&c_ui, NOTE_ERROR, err.clone()),
+                    Ok(_) => notify(&c_ui, NOTE_OK, t("MCP 服务已启动", "MCP server started")),
+                    Err(_) if !c_enabled => notify(&c_ui, NOTE_OK, t("MCP 服务已关闭", "MCP server stopped")),
+                    Err(err) => notify(&c_ui, NOTE_ERROR, friendly_error(err)),
                 }
             });
         });
@@ -271,11 +339,15 @@ pub fn run(
     z_ui.on_mcp_self_check(move || {
         let Some(z_ui) = z_weak.upgrade() else { return; };
         let Ok(z_port) = u16::try_from(z_ui.get_mcp_port()) else { return; };
+        let z_gen = MCP_CHECK_GEN.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
         z_ui.set_mcp_checking(true);
         let z_weak = z_weak.clone();
         z_runtime.spawn(async move {
             let (z_level, z_title, z_detail) = crate::mcp::self_check(z_port).await;
             let _ = z_weak.upgrade_in_event_loop(move |c_ui| {
+                if MCP_CHECK_GEN.load(Ordering::Acquire) != z_gen {
+                    return;
+                }
                 c_ui.set_mcp_checking(false);
                 c_ui.set_mcp_check_level(z_level);
                 c_ui.set_mcp_check_detail(z_detail.into());
@@ -311,11 +383,28 @@ pub fn run(
                     }
                     c_ui.set_font_draft_index(c_ui.invoke_font_index(c_name.clone()));
                     c_ui.set_font_draft(c_name.clone());
-                    notify(&c_ui, NOTE_OK, format!("{c_name} 已下载, 点击应用即可使用"));
+                    notify(
+                        &c_ui,
+                        NOTE_OK,
+                        if is_en() {
+                            format!("{c_name} downloaded; click Apply to use")
+                        } else {
+                            format!("{c_name} 已下载, 点击应用即可使用")
+                        },
+                    );
                 }
                 Err(err) => {
                     set_font_state(&c_ui, &c_name, 0);
-                    notify(&c_ui, NOTE_ERROR, format!("{c_name} 下载失败: {err:#}"));
+                    let l_err = friendly_error(&format!("{err:#}"));
+                    notify(
+                        &c_ui,
+                        NOTE_ERROR,
+                        if is_en() {
+                            format!("Failed to download {c_name}: {l_err}")
+                        } else {
+                            format!("{c_name} 下载失败: {l_err}")
+                        },
+                    );
                 }
             });
         });
@@ -388,7 +477,12 @@ pub fn run(
                 .call("set_transfer_limits", json!({"concurrency":l_concurrency,"batch":l_batch}), Actor::User)
                 .await
             {
-                let l_message = format!("传输设置保存失败: {err}");
+                let l_err = friendly_error(&format!("{err}"));
+                let l_message = if is_en() {
+                    format!("Failed to save transfer settings: {l_err}")
+                } else {
+                    format!("传输设置保存失败: {l_err}")
+                };
                 let _ = z_weak.upgrade_in_event_loop(move |c_ui| notify(&c_ui, NOTE_ERROR, l_message));
             }
         }
@@ -422,7 +516,12 @@ pub fn run(
                 .call("set_theme", json!({"dark_theme":z_dark}), Actor::User)
                 .await
             {
-                let z_message = format!("主题保存失败: {err}");
+                let z_err = friendly_error(&format!("{err}"));
+                let z_message = if is_en() {
+                    format!("Failed to save theme: {z_err}")
+                } else {
+                    format!("主题保存失败: {z_err}")
+                };
                 let _ = z_weak.upgrade_in_event_loop(move |c_ui| notify(&c_ui, NOTE_ERROR, z_message));
             }
         }
@@ -453,10 +552,21 @@ pub fn run(
     });
     let z_snapshot = z_state.clone();
     let z_weak = z_ui.as_weak();
-    z_ui.on_monitor_opened(move || {
+    let (z_backend, z_runtime) = (c_backend.clone(), c_runtime.clone());
+    z_ui.on_monitor_toggled(move |c_expanded| {
+        // 同步按点击顺序通知后台, 避免快速展开/收起时并发 spawn 乱序导致前后端开关反转.
+        {
+            let _l_guard = z_runtime.enter();
+            z_backend.set_monitor_enabled(c_expanded);
+        }
         let Some(z_ui) = z_weak.upgrade() else {
             return;
         };
+        if !c_expanded {
+            // 收起停流后立即归零折叠栏 MiniBar, 避免残留停流前的占用率.
+            apply_monitor_usage(&z_ui, None);
+            return;
+        }
         let Ok(z_state) = z_snapshot.lock() else {
             return;
         };
@@ -472,6 +582,39 @@ pub fn run(
         apply_monitor_processes(&z_ui, z_session);
     });
     let z_answers = Arc::new(Mutex::new(Vec::<String>::new()));
+    // 语言切换: 立即更新全局语言并按缓存状态重建文案, 再顺序落盘.
+    let (z_lang_tx, mut z_lang_rx) = tokio::sync::watch::channel(z_lang);
+    let z_weak = z_ui.as_weak();
+    let z_lang_state = z_state.clone();
+    let z_lang_answers = z_answers.clone();
+    z_ui.on_language_changed(move |c_index| {
+        let z_next = if c_index == 1 { i18n::Lang::En } else { i18n::Lang::Zh };
+        i18n::set(z_next);
+        if let Some(z_ui) = z_weak.upgrade() {
+            let l_state = z_lang_state.lock().unwrap_or_else(PoisonError::into_inner).clone();
+            refresh_language_ui(&z_ui, &l_state, &z_lang_answers);
+        }
+        let _ = z_lang_tx.send(z_next);
+    });
+    let z_backend = c_backend.clone();
+    let z_weak = z_ui.as_weak();
+    c_runtime.spawn(async move {
+        while z_lang_rx.changed().await.is_ok() {
+            let l_next = *z_lang_rx.borrow_and_update();
+            if let Err(err) = z_backend
+                .call("set_language", json!({"language": i18n::code(l_next)}), Actor::User)
+                .await
+            {
+                let l_err = friendly_error(&format!("{err}"));
+                let l_message = if is_en() {
+                    format!("Failed to save language: {l_err}")
+                } else {
+                    format!("语言保存失败: {l_err}")
+                };
+                let _ = z_weak.upgrade_in_event_loop(move |c_ui| notify(&c_ui, NOTE_ERROR, l_message));
+            }
+        }
+    });
     // 显示分组: 立即按上次状态重建各处服务器名称 (状态没变化时轮询不会重新应用), 再保存设置.
     let z_backend = c_backend.clone();
     let z_runtime = c_runtime.clone();
@@ -541,11 +684,11 @@ pub fn run(
         let Some(z_ui) = z_weak.upgrade() else {
             return;
         };
-        if !z_ui.get_remote_ready() {
+        if !z_ui.get_remote_ready() || z_ui.get_modal_open() || z_ui.get_transfers_open() {
             return;
         }
         let Ok(z_paths) = c_data.file_paths() else {
-            notify(&z_ui, NOTE_ERROR, "无法读取拖拽文件路径");
+            notify(&z_ui, NOTE_ERROR, t("无法读取拖拽文件路径", "Unable to read dropped file paths"));
             return;
         };
         let z_limit = z_ui.get_transfer_batch_limit().max(1) as usize;
@@ -592,7 +735,7 @@ pub fn run(
                 l_tx
             });
             if z_worker.try_send((z_data, z_epoch)).is_err() {
-                show_notice(z_weak.clone(), NOTE_WARN, "终端输入队列已满, 请稍后重试".into());
+                show_notice(z_weak.clone(), NOTE_WARN, t("终端输入队列已满, 请稍后重试", "Terminal input queue full; try again").into());
             }
         }
     });
@@ -617,7 +760,7 @@ pub fn run(
             let z_session = z_ui.get_active_session().to_string();
             if !z_confirm {
                 if !enqueue_input(&z_tx, z_session, z_encode(&z_ui, z_text), 0) {
-                    notify(&z_ui, NOTE_WARN, "终端输入队列已满, 请稍后重试");
+                    notify(&z_ui, NOTE_WARN, t("终端输入队列已满, 请稍后重试", "Terminal input queue full; try again"));
                 }
                 return;
             }
@@ -630,24 +773,27 @@ pub fn run(
             let z_mark = (z_link(&z_paste_state, &z_session), z_tx.1.lock().unwrap().get(&z_session).copied().unwrap_or(0));
             let (z_tx, z_weak, z_paste_state) = (z_tx.clone(), z_weak.clone(), z_paste_state.clone());
             z_runtime.spawn(async move {
-                let l_answer = rfd::AsyncMessageDialog::new()
-                    .set_title("粘贴多行内容")
-                    .set_level(rfd::MessageLevel::Warning)
-                    .set_description(format!("要粘贴的内容有 {z_lines} 行, 在 Shell 中可能逐行执行. 确定粘贴到终端?"))
-                    .set_buttons(rfd::MessageButtons::OkCancelCustom("粘贴".into(), "取消".into()))
-                    .show()
-                    .await;
-                if matches!(l_answer, rfd::MessageDialogResult::Ok | rfd::MessageDialogResult::Yes)
-                    || matches!(&l_answer, rfd::MessageDialogResult::Custom(c) if c == "粘贴")
+                let l_desc = if is_en() {
+                    format!("Paste {z_lines} lines into the terminal? Commands may run line by line.")
+                } else {
+                    format!("要粘贴的内容有 {z_lines} 行, 在 Shell 中可能逐行执行. 确定粘贴到终端?")
+                };
+                if confirm_dialog(
+                    t("粘贴多行内容", "Paste Multiple Lines"),
+                    l_desc,
+                    rfd::MessageLevel::Warning,
+                    t("粘贴", "Paste"),
+                )
+                .await
                 {
                     let _ = z_weak.upgrade_in_event_loop(move |c_ui| {
                         let l_mark = (z_link(&z_paste_state, &z_session), z_tx.1.lock().unwrap().get(&z_session).copied().unwrap_or(0));
                         if c_ui.get_active_session().as_str() != z_session || l_mark != z_mark {
-                            notify(&c_ui, NOTE_WARN, "终端已切换或重新连接, 粘贴已取消");
+                            notify(&c_ui, NOTE_WARN, t("终端已切换或重新连接, 粘贴已取消", "Terminal changed or reconnected; paste cancelled"));
                             return;
                         }
                         if !enqueue_input(&z_tx, z_session, z_encode(&c_ui, z_text), z_mark.0.1) {
-                            notify(&c_ui, NOTE_WARN, "终端输入队列已满, 请稍后重试");
+                            notify(&c_ui, NOTE_WARN, t("终端输入队列已满, 请稍后重试", "Terminal input queue full; try again"));
                         }
                     });
                 }
@@ -660,7 +806,7 @@ pub fn run(
         let Some(z_ui) = z_weak.upgrade() else { return false; };
         let z_data = terminal_wheel(c_lines, c_row, c_col, c_modifiers, z_ui.get_mouse_mode(), z_ui.get_application_cursor());
         if !enqueue_input(&z_tx, z_ui.get_active_session().to_string(), z_data, 0) {
-            notify(&z_ui, NOTE_WARN, "终端输入队列已满, 请稍后重试");
+            notify(&z_ui, NOTE_WARN, t("终端输入队列已满, 请稍后重试", "Terminal input queue full; try again"));
         }
         true
     });
@@ -723,7 +869,7 @@ pub fn run(
             return false;
         };
         if !enqueue_input(&z_tx, z_ui.get_active_session().to_string(), z_data, 0) {
-            notify(&z_ui, NOTE_WARN, "终端输入队列已满, 请稍后重试");
+            notify(&z_ui, NOTE_WARN, t("终端输入队列已满, 请稍后重试", "Terminal input queue full; try again"));
         }
         true
     });
@@ -794,7 +940,7 @@ pub fn run(
     let z_runtime = c_runtime.clone();
     z_ui.on_save_connection(move || {
         let Some(z_ui) = z_weak.upgrade() else { return; };
-        let Ok(z_port) = z_ui.get_edit_port().parse::<u16>() else { z_ui.set_form_error("请输入有效端口 (1-65535)".into()); return; };
+        let Ok(z_port) = z_ui.get_edit_port().parse::<u16>() else { z_ui.set_form_error(t("请输入有效端口 (1-65535)", "Enter a valid port (1-65535)").into()); return; };
         let z_id = if z_ui.get_edit_id().is_empty() { uuid::Uuid::new_v4().to_string() } else { z_ui.get_edit_id().to_string() };
         let mut z_args = json!({"connection":{"id":z_id,"name":if z_ui.get_edit_name().trim().is_empty() { z_ui.get_edit_host().to_string() } else { z_ui.get_edit_name().to_string() },"host":z_ui.get_edit_host().to_string(),"port":z_port,"username":z_ui.get_edit_user().to_string(),"group":z_ui.get_edit_group().to_string(),"auth":match z_ui.get_edit_auth(){1=>"private_key",2=>"keyboard_interactive",_=>"password"},"private_key_path":if z_ui.get_edit_key_path().is_empty(){None}else{Some(z_ui.get_edit_key_path().to_string())},"mcp_allowed":z_ui.get_edit_mcp(),"proxy_id":Some(z_ui.get_edit_proxy_id().to_string()).filter(|c| !c.is_empty()),"admin_password":match z_ui.get_edit_admin(){1=>"login",2=>"custom",_=>"none"}}});
         if !z_ui.get_edit_password().is_empty() { z_args["password"] = Value::String(z_ui.get_edit_password().to_string()); }
@@ -808,7 +954,7 @@ pub fn run(
     let z_runtime = c_runtime.clone();
     z_ui.on_save_proxy(move || {
         let Some(z_ui) = z_weak.upgrade() else { return; };
-        let Ok(z_port) = z_ui.get_proxy_edit_port().trim().parse::<u16>() else { z_ui.set_form_error("请输入有效端口 (1-65535)".into()); return; };
+        let Ok(z_port) = z_ui.get_proxy_edit_port().trim().parse::<u16>() else { z_ui.set_proxy_form_error(t("请输入有效端口 (1-65535)", "Enter a valid port (1-65535)").into()); return; };
         let mut z_args = json!({"proxy":{"id":z_ui.get_proxy_edit_id().to_string(),"name":z_ui.get_proxy_edit_name().to_string(),"kind":if z_ui.get_proxy_edit_kind() == 1 { "http" } else { "socks5" },"host":z_ui.get_proxy_edit_host().to_string(),"port":z_port,"username":z_ui.get_proxy_edit_user().trim().to_string()}});
         // 密码留空保持原值; 去掉用户名时一并清除密码.
         if !z_ui.get_proxy_edit_password().is_empty() {
@@ -878,7 +1024,6 @@ pub fn run(
             .map(|c| SharedString::from(string(c, "group")))
             .unwrap_or_else(|| z_ui.get_selected_command_group());
         let z_index = z_ui.get_command_groups().iter().position(|c| c == z_group).unwrap_or(0);
-        z_ui.set_saved_command_group(z_group);
         z_ui.set_saved_command_group_index(z_index as i32);
         z_ui.set_saved_command_text(z_command.map(|c| string(c, "command")).unwrap_or("").into());
         z_ui.set_command_editing(true);
@@ -927,23 +1072,22 @@ pub fn run(
                 z_ui.invoke_restore_terminal_view();
                 // 缓存只用于立即显示, 切回后必须重新取一页; 仍保留滚动偏移, 不把历史浏览推到底部.
                 *z_view_sequence.lock().unwrap() = (String::new(), u64::MAX, -1);
-                z_ui.invoke_terminal_refresh();
-                if let Ok(l_state) = z_view_snapshot.try_lock() {
-                    let l_session = array(&l_state, "sessions").iter().find(|c| string(c, "session_id") == z_arg);
-                    z_ui.set_active_latency_ms(
-                        l_session
-                            .filter(|c| string(c, "status") == "connected")
-                            .and_then(|c| c.get("latency_ms"))
-                            .and_then(Value::as_i64)
-                            .map(|c| c.clamp(0, i32::MAX as i64) as i32)
-                            .unwrap_or(-1),
-                    );
-                    apply_monitor_usage(&z_ui, l_session);
-                    if z_ui.get_monitor_expanded() {
-                        apply_monitor_history(&z_ui, l_session);
-                        apply_monitor_processes(&z_ui, l_session);
+                // 从最近状态快照立即回填连接 ID、断开原因与监控元数据 (try_lock 避开 apply_state 重入死锁);
+                // 新建标签尚未进入快照时清空旧标签的监控曲线、进程与 MiniBar, 防止残留上一服务器数据.
+                if let Ok(l_state) = z_view_snapshot.try_lock()
+                    && !l_state.is_null()
+                {
+                    if array(&l_state, "sessions").iter().any(|c| string(c, "session_id") == z_arg) {
+                        apply_active_session(&z_ui, &l_state, &z_arg);
+                    } else {
+                        apply_monitor_usage(&z_ui, None);
+                        if z_ui.get_monitor_expanded() {
+                            apply_monitor_history(&z_ui, None);
+                            apply_monitor_processes(&z_ui, None);
+                        }
                     }
                 }
+                z_ui.invoke_terminal_refresh();
             }
             return;
         }
@@ -955,7 +1099,7 @@ pub fn run(
             });
             match l_id.filter(|c| !c.is_empty()) {
                 Some(l_id) => z_ui.invoke_edit_connection(l_id.into()),
-                None => notify(&z_ui, NOTE_WARN, "该标签没有对应的连接配置"),
+                None => notify(&z_ui, NOTE_WARN, t("该标签没有对应的连接配置", "This tab has no saved host configuration")),
             }
             return;
         }
@@ -1021,7 +1165,9 @@ pub fn run(
         }
         if matches!(c_method.as_str(), "terminal_enter" | "terminal_clear" | "terminal_interrupt") {
             let z_data = match c_method.as_str() { "terminal_clear" => "\u{c}", "terminal_interrupt" => "\u{3}", _ => "\r" };
-            if !enqueue_input(&z_action_tx, z_session, z_data.into(), 0) { notify(&z_ui, NOTE_WARN, "终端输入队列已满, 请稍后重试"); }
+            if !enqueue_input(&z_action_tx, z_session, z_data.into(), 0) {
+                notify(&z_ui, NOTE_WARN, t("终端输入队列已满, 请稍后重试", "Terminal input queue full; try again"));
+            }
             return;
         }
         if matches!(c_method.as_str(), "set_permissions" | "rename_file" | "delete_files" | "delete_files_fast" | "create_directory" | "create_file") {
@@ -1094,7 +1240,7 @@ pub fn run(
             "prepare_delete" => {
                 if !z_ui.get_remote_ready() { return; }
                 let l_selected = z_ui.get_files().iter().filter(|c| c.selected).collect::<Vec<_>>();
-                if l_selected.is_empty() { notify(&z_ui, NOTE_WARN, "请选择要删除的文件"); return; }
+                if l_selected.is_empty() { notify(&z_ui, NOTE_WARN, t("请选择要删除的文件", "Select files to delete")); return; }
                 // 按键删除 (key): 单个文件走普通删除; 多选或含目录走快速删除, 非空目录也能删.
                 let l_fast = z_arg == "fast" || (z_arg == "key" && (l_selected.len() > 1 || l_selected.iter().any(|c| c.directory)));
                 let l_paths = l_selected.into_iter().map(|c| c.path).collect::<Vec<_>>();
@@ -1128,7 +1274,8 @@ pub fn run(
                     Some((l_stem, l_ext)) if !l_file.directory && !l_stem.is_empty() => (l_stem.to_owned(), format!(".{l_ext}")),
                     _ => (l_file.name.to_string(), String::new()),
                 };
-                let Some(l_name) = (1..1000).map(|i| format!("{l_stem}-副本{i}{l_ext}")).find(|c| !l_names.contains(c)) else { return; };
+                let l_suffix = t("-副本", "-copy");
+                let Some(l_name) = (1..1000).map(|i| format!("{l_stem}{l_suffix}{i}{l_ext}")).find(|c| !l_names.contains(c)) else { return; };
                 let l_parent = z_arg.rsplit_once('/').map(|c| c.0).unwrap_or("");
                 ("copy_file",json!({"session_id":z_session,"path":z_arg,"new_path":format!("{l_parent}/{l_name}")}))
             }
@@ -1148,16 +1295,22 @@ pub fn run(
                 let l_users = z_ui.get_connections().iter().filter(|c| c.proxy_id.as_str() == z_arg).count();
                 let (l_runtime, l_backend, l_weak, l_id) = (z_runtime.clone(), z_backend.clone(), z_weak.clone(), z_arg.clone());
                 z_runtime.spawn(async move {
-                    let l_text = if l_users > 0 { format!("有 {l_users} 台服务器在使用这个代理, 删除后它们改为直连.") } else { "删除这个代理?".to_owned() };
-                    let l_confirmed = rfd::AsyncMessageDialog::new()
-                        .set_title("删除代理")
-                        .set_level(rfd::MessageLevel::Warning)
-                        .set_description(l_text)
-                        .set_buttons(rfd::MessageButtons::OkCancelCustom("删除".into(), "取消".into()))
-                        .show()
-                        .await;
-                    if matches!(l_confirmed, rfd::MessageDialogResult::Ok | rfd::MessageDialogResult::Yes)
-                        || matches!(&l_confirmed, rfd::MessageDialogResult::Custom(c) if c == "删除")
+                    let l_text = if l_users > 0 {
+                        if is_en() {
+                            format!("{l_users} host(s) use this proxy and will switch to Direct.")
+                        } else {
+                            format!("有 {l_users} 台服务器在使用这个代理, 删除后它们改为直连.")
+                        }
+                    } else {
+                        t("删除这个代理?", "Delete this proxy?").to_owned()
+                    };
+                    if confirm_dialog(
+                        t("删除代理", "Delete Proxy"),
+                        l_text,
+                        rfd::MessageLevel::Warning,
+                        t("删除", "Delete"),
+                    )
+                    .await
                     {
                         dispatch(&l_runtime, &l_backend, l_weak, "delete_proxy", json!({"proxy_id":l_id}));
                     }
@@ -1192,10 +1345,27 @@ pub fn run(
     let z_backend = c_backend.clone();
     let z_runtime = c_runtime.clone();
     z_ui.on_choose_path(move |c_kind| {
+        static DIALOG_OPEN: AtomicBool = AtomicBool::new(false);
+        struct DialogGuard(&'static AtomicBool);
+        impl Drop for DialogGuard {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
         let Some(z_ui) = z_weak.upgrade() else { return; };
         let z_kind = c_kind.to_string();
         if matches!(z_kind.as_str(), "upload" | "upload_folder" | "download" | "download_to") && !z_ui.get_remote_ready() { return; }
         let z_download_dir = z_ui.get_download_dir().to_string();
+        // 需要弹出系统文件框的操作做并发防重, 避免无宿主非模态对话框在 Windows/macOS 上叠加打开.
+        let z_needs_os_dialog = !(z_kind == "download" && !z_download_dir.is_empty());
+        let z_dialog_guard = if z_needs_os_dialog {
+            if DIALOG_OPEN.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            Some(DialogGuard(&DIALOG_OPEN))
+        } else {
+            None
+        };
         let z_connection = z_ui.get_selected_connection().to_string();
         let z_group = z_ui.get_selected_connection_group().to_string();
         let z_session = z_ui.get_active_session().to_string();
@@ -1207,27 +1377,29 @@ pub fn run(
         let z_weak = z_weak.clone();
         let z_backend = z_backend.clone();
         z_runtime.spawn(async move {
+            let mut z_dialog_guard = z_dialog_guard;
             // 用户选文件时后台提前建立传输连接, 选完即可开始.
             if matches!(z_kind.as_str(), "upload" | "upload_folder" | "download" | "download_to") {
                 let _ = z_backend.call("warm_transfer", json!({"session_id":z_session}), Actor::User).await;
             }
             let z_dialog = rfd::AsyncFileDialog::new().set_title(match z_kind.as_str() {
-                "upload" => "选择要上传的文件",
-                "upload_folder" => "选择要上传的文件夹",
-                "download" | "download_to" => "选择下载保存位置",
-                "download_dir" => "选择默认下载目录",
-                "key" => "选择私钥文件",
-                "export" => "导出所选连接",
-                "export_all" => "选择全部连接的导出目录",
-                "export_group" => "选择分组的导出目录",
-                "import_folder" | "import_folder_all" => "选择连接配置目录",
-                "import_commands" => "选择要导入的命令文件",
-                "export_commands" => "导出全部命令",
-                _ => "选择连接配置文件",
+                "upload" => t("选择要上传的文件", "Select Files to Upload"),
+                "upload_folder" => t("选择要上传的文件夹", "Select Folders to Upload"),
+                "download" | "download_to" => t("选择下载保存位置", "Select Download Location"),
+                "download_dir" => t("选择默认下载目录", "Select Default Download Folder"),
+                "key" => t("选择私钥文件", "Select Private Key"),
+                "export" => t("导出所选连接", "Export Selected Host"),
+                "export_all" => t("选择全部连接的导出目录", "Select Export Folder for All Hosts"),
+                "export_group" => t("选择分组的导出目录", "Select Export Folder for Group"),
+                "import_folder" | "import_folder_all" => t("选择连接配置目录", "Select Host Config Folder"),
+                "import_commands" => t("选择要导入的命令文件", "Select Commands File to Import"),
+                "export_commands" => t("导出全部命令", "Export All Commands"),
+                _ => t("选择连接配置文件", "Select Host Config File"),
             });
             if matches!(z_kind.as_str(), "upload" | "upload_folder") {
                 // 系统对话框不能同时选文件和文件夹 (Windows), 分成两个入口.
                 let z_paths = if z_kind == "upload" { z_dialog.pick_files().await } else { z_dialog.pick_folders().await };
+                drop(z_dialog_guard.take());
                 if let Some(z_paths) = z_paths {
                     upload_paths(&tokio::runtime::Handle::current(), &z_backend, z_weak, z_session, z_listed_link, z_upload_target, z_paths.into_iter().take(z_batch_limit + 1).map(|c| c.path().to_path_buf()).collect(), z_batch_limit);
                 }
@@ -1235,32 +1407,51 @@ pub fn run(
             }
             if matches!(z_kind.as_str(), "download" | "download_to") {
                 if z_selected_files.is_empty() || z_selected_files.len() > z_batch_limit {
-                    show_notice(z_weak, NOTE_WARN, format!("一次请选择 1～{z_batch_limit} 项下载")); return;
+                    show_notice(
+                        z_weak,
+                        NOTE_WARN,
+                        if is_en() {
+                            format!("Select 1 to {z_batch_limit} items to download")
+                        } else {
+                            format!("一次请选择 1～{z_batch_limit} 项下载")
+                        },
+                    );
+                    return;
                 }
                 if z_selected_files.iter().any(|c| c.name.is_empty() || c.name == "." || c.name == ".." || c.name.contains('/') || c.name.chars().any(char::is_control)) {
-                    show_notice(z_weak, NOTE_WARN, "下载项的名称不能包含路径或控制字符".into()); return;
+                    show_notice(z_weak, NOTE_WARN, t("下载项的名称不能包含路径或控制字符", "Item name cannot contain path separators or control characters").into());
+                    return;
                 }
                 // "下载" 使用默认目录, "下载到…" 由系统对话框选择位置.
                 let z_default = (z_kind == "download" && !z_download_dir.is_empty())
                     .then(|| std::path::PathBuf::from(&z_download_dir));
-                // 直接存入下载目录且达到 3 项时先确认目录; "下载到…" 刚选过位置, 不再确认.
-                if z_default.is_some() && z_selected_files.len() >= 3 && !confirm_download(z_weak.clone(), z_selected_files.len()).await { return; }
+                // 直接存入下载目录且达到 3 项时先确认目录 (绑定本次快照路径, 避免弹窗期间修改默认目录造成错位).
+                if z_default.is_some() && z_selected_files.len() >= 3 && !confirm_download(z_weak.clone(), z_selected_files.len(), z_download_dir.clone()).await { return; }
                 // 文件夹、多选和默认目录都存到目录下, 只有单个文件用另存为.
                 let z_multiple = z_default.is_some() || z_selected_files.len() > 1 || z_selected_files[0].directory;
                 let z_destination = match z_default {
                     Some(l_dir) => {
                         if let Err(err) = tokio::fs::create_dir_all(&l_dir).await {
-                            show_notice(z_weak, NOTE_ERROR, format!("创建下载目录失败: {} ({err})", l_dir.display()));
+                            show_notice(
+                                z_weak,
+                                NOTE_ERROR,
+                                if is_en() {
+                                    format!("Failed to create download folder: {} ({err})", l_dir.display())
+                                } else {
+                                    format!("创建下载目录失败: {} ({err})", l_dir.display())
+                                },
+                            );
                             return;
                         }
                         l_dir
                     }
                     None => {
                         let l_picked = if z_multiple {
-                            z_dialog.set_title("选择下载保存目录").pick_folder().await
+                            z_dialog.set_title(t("选择下载保存目录", "Select Download Folder")).pick_folder().await
                         } else {
                             z_dialog.set_file_name(local_file_name(&z_selected_files[0].name)).save_file().await
                         };
+                        drop(z_dialog_guard.take());
                         let Some(l_picked) = l_picked else { return; };
                         l_picked.path().to_path_buf()
                     }
@@ -1268,62 +1459,99 @@ pub fn run(
                 // 单个文件的保存对话框已由系统确认替换; 存到目录时同名冲突统一询问一次, 文件夹覆盖即合并到已有文件夹.
                 let mut z_overwrite = vec![!z_multiple; z_selected_files.len()];
                 let mut z_skip = vec![false; z_selected_files.len()];
+                let z_dirs = z_selected_files.iter().map(|c| c.directory).collect::<Vec<_>>();
                 let mut z_targets = z_selected_files
                     .iter()
                     .map(|c| if z_multiple { z_destination.as_path().join(local_file_name(&c.name)) } else { z_destination.as_path().to_path_buf() })
                     .collect::<Vec<_>>();
                 if z_multiple {
-                    // Windows 把非法字符换成下划线后, 不同远端文件 (如 a:b 与 a?b) 可能得到同一本机名, 批次内先去重.
-                    let l_key = |c: &std::path::Path| local_name_key(&c.to_string_lossy());
-                    let mut l_seen = std::collections::HashSet::new();
-                    for z_target in &mut z_targets {
-                        if !l_seen.insert(l_key(z_target)) {
-                            let l_name = z_target.file_name().map(|c| c.to_string_lossy().into_owned()).unwrap_or_default();
-                            let l_dir = z_destination.as_path().to_path_buf();
-                            *z_target = l_dir.join(unique_name(&l_name, |c| l_seen.contains(&l_key(&l_dir.join(c))) || l_dir.join(c).exists()));
-                            l_seen.insert(l_key(z_target));
+                    // 本地同名检查与去重移到阻塞线程, 使用 symlink_metadata 识别悬空符号链接.
+                    let l_dest = z_destination.clone();
+                    let l_dirs = z_dirs.clone();
+                    let l_prep = tokio::task::spawn_blocking(move || {
+                        let l_exists = |c: &std::path::Path| std::fs::symlink_metadata(c).is_ok();
+                        let l_key = |c: &std::path::Path| local_name_key(&c.to_string_lossy());
+                        let mut l_seen = std::collections::HashSet::new();
+                        for (l_target, &l_is_dir) in z_targets.iter_mut().zip(&l_dirs) {
+                            if !l_seen.insert(l_key(l_target)) {
+                                let l_name = l_target.file_name().map(|c| c.to_string_lossy().into_owned()).unwrap_or_default();
+                                *l_target = l_dest.join(unique_name(&l_name, l_is_dir, |c| l_seen.contains(&l_key(&l_dest.join(c))) || l_exists(&l_dest.join(c))));
+                                l_seen.insert(l_key(l_target));
+                            }
                         }
-                    }
-                    let l_existing = z_targets.iter().map(|c| c.exists()).collect::<Vec<_>>();
-                    let l_conflicts = z_targets.iter().zip(&l_existing).filter(|(_, c)| **c).filter_map(|(c, _)| c.file_name()).map(|c| c.to_string_lossy().into_owned()).collect::<Vec<_>>();
+                        let l_existing = z_targets.iter().map(|c| l_exists(c)).collect::<Vec<_>>();
+                        let l_conflicts = z_targets.iter().zip(&l_existing).filter(|(_, c)| **c).filter_map(|(c, _)| c.file_name()).map(|c| c.to_string_lossy().into_owned()).collect::<Vec<_>>();
+                        (z_targets, l_seen, l_existing, l_conflicts)
+                    })
+                    .await;
+                    let Ok((l_targets, l_seen, l_existing, l_conflicts)) = l_prep else {
+                        show_notice(z_weak, NOTE_ERROR, t("检查本地下载目录异常", "Failed to inspect local download folder").into());
+                        return;
+                    };
+                    z_targets = l_targets;
                     if !l_conflicts.is_empty() {
-                        let Some(l_choice) = ask_conflict(z_weak.clone(), &l_conflicts).await else { return; };
+                        let l_ctx = if is_en() {
+                            z_destination.display().to_string()
+                        } else {
+                            format!("下载到 {}", z_destination.display())
+                        };
+                        let Some(l_choice) = ask_conflict(z_weak.clone(), l_ctx, &l_conflicts).await else { return; };
                         match l_choice {
                             ConflictChoice::Overwrite => z_overwrite = l_existing,
                             ConflictChoice::Skip => z_skip = l_existing,
                             ConflictChoice::KeepBoth => {
-                                for z_target in &mut z_targets {
-                                    if z_target.exists() {
-                                        let l_name = z_target.file_name().map(|c| c.to_string_lossy().into_owned()).unwrap_or_default();
-                                        let l_dir = z_destination.as_path().to_path_buf();
-                                        *z_target = l_dir.join(unique_name(&l_name, |c| l_dir.join(c).exists() || l_seen.contains(&l_key(&l_dir.join(c)))));
-                                        l_seen.insert(l_key(z_target));
+                                let l_dest = z_destination.clone();
+                                let l_dirs = z_dirs.clone();
+                                let Ok(l_targets) = tokio::task::spawn_blocking(move || {
+                                    let l_exists = |c: &std::path::Path| std::fs::symlink_metadata(c).is_ok();
+                                    let l_key = |c: &std::path::Path| local_name_key(&c.to_string_lossy());
+                                    let mut l_seen = l_seen;
+                                    for (l_target, &l_is_dir) in z_targets.iter_mut().zip(&l_dirs) {
+                                        if l_exists(l_target) {
+                                            let l_name = l_target.file_name().map(|c| c.to_string_lossy().into_owned()).unwrap_or_default();
+                                            *l_target = l_dest.join(unique_name(&l_name, l_is_dir, |c| l_exists(&l_dest.join(c)) || l_seen.contains(&l_key(&l_dest.join(c)))));
+                                            l_seen.insert(l_key(l_target));
+                                        }
                                     }
-                                }
+                                    z_targets
+                                }).await else {
+                                    show_notice(z_weak, NOTE_ERROR, t("计算下载文件名异常", "Failed to compute download filename").into());
+                                    return;
+                                };
+                                z_targets = l_targets;
                             }
                         }
                     }
                 }
                 let mut z_count = 0;
+                let mut z_failed = 0;
+                let mut z_first_err: Option<anyhow::Error> = None;
                 let z_skipped = z_skip.iter().filter(|c| **c).count();
                 for (i, (z_file, z_local)) in z_selected_files.iter().zip(z_targets).enumerate() {
                     if z_skip[i] { continue; }
                     let z_result = z_backend.call(if z_file.directory { "download_directory" } else { "download_file" },json!({"session_id":z_session,"_link":z_listed_link,"local_path":z_local,"remote_path":z_file.path.to_string(),"overwrite":z_overwrite[i],"size_hint":z_file.size_bytes.parse::<u64>().ok()}),Actor::User).await;
                     if let Err(err) = z_result {
-                        show_notice(z_weak, NOTE_ERROR, batch_error("下载", z_count, &err)); return;
+                        if is_fatal_batch_error(&err) {
+                            show_notice(z_weak, NOTE_ERROR, batch_error(false, z_count, &err));
+                            return;
+                        }
+                        z_failed += 1;
+                        z_first_err.get_or_insert(err);
+                        continue;
                     }
                     z_count += 1;
                 }
-                let _ = z_weak.upgrade_in_event_loop(move |c_ui| notify(&c_ui, NOTE_OK, format!("已加入 {z_count} 个下载任务{}", if z_skipped > 0 { format!(", 已跳过 {z_skipped} 个同名文件") } else { String::new() })));
+                finish_transfer_batch(z_weak, false, z_count, z_failed, z_skipped, z_first_err);
                 return;
             }
             let z_path = match z_kind.as_str() {
-                "export" => z_dialog.set_file_name(format!("{z_connection}_connect_config.json")).add_filter("连接配置", &["json"]).save_file().await,
-                "export_commands" => z_dialog.set_file_name("hipshell_commands.json").add_filter("命令文件", &["json"]).save_file().await,
-                "import_commands" => z_dialog.add_filter("命令文件", &["json"]).pick_file().await,
+                "export" => z_dialog.set_file_name(format!("{z_connection}_connect_config.json")).add_filter(t("连接配置", "Host Config"), &["json"]).save_file().await,
+                "export_commands" => z_dialog.set_file_name("hipshell_commands.json").add_filter(t("命令文件", "Commands"), &["json"]).save_file().await,
+                "import_commands" => z_dialog.add_filter(t("命令文件", "Commands"), &["json"]).pick_file().await,
                 "export_all" | "export_group" | "import_folder" | "import_folder_all" | "download_dir" => z_dialog.pick_folder().await,
                 _ => z_dialog.pick_file().await,
             };
+            drop(z_dialog_guard.take());
             let Some(z_path) = z_path else { return; };
             let z_path = z_path.path().to_string_lossy().into_owned();
             let z_call = match z_kind.as_str() {
@@ -1418,6 +1646,15 @@ pub fn run(
         let z_session = z_ui.get_active_session().to_string();
         let z_generation = z_view_generation.load(Ordering::Relaxed);
         let z_empty = z_ui.get_active_session_empty();
+        // 已断开或失败的离线标签不再每 25ms 轮询/同步终端尺寸, 重连切回在线后再重新同步.
+        let z_offline = matches!(z_ui.get_active_state(), 0 | 4);
+        if z_session.is_empty() || z_empty || z_offline {
+            if z_offline {
+                z_dimensions.borrow_mut().0.clear();
+            }
+            z_busy.store(false, Ordering::Release);
+            return;
+        }
         let z_scroll = z_ui.get_terminal_scroll_offset();
         // 只在拖选过程中暂停读取画面; 已有选区时照常刷新, 由 apply_polled_terminal 决定是否保留选区.
         let z_selection = z_ui.get_selection_dragging();
@@ -1429,10 +1666,10 @@ pub fn run(
         if z_resize_failed.swap(false, Ordering::AcqRel) {
             z_dimensions.borrow_mut().0.clear();
         }
-        let z_resize = !z_session.is_empty() && !z_empty && *z_dimensions.borrow() != z_size;
+        let z_resize = *z_dimensions.borrow() != z_size;
         if z_resize {
             // 终端可显示的列数与行数, 随窗口变化并同步给服务器.
-            z_ui.set_terminal_size_text(format!("{} 列 · {} 行", z_size.2, z_size.1).into());
+            z_ui.set_terminal_size_text(format_terminal_size(z_size.2, z_size.1).into());
             *z_dimensions.borrow_mut() = z_size.clone();
             // 无论是否在翻看历史, 尺寸变化后都需要刷新一次视图与展示尺寸.
             z_sequence.lock().unwrap().0.clear();
@@ -1452,10 +1689,6 @@ pub fn run(
             };
             (z_after_seq, z_read_view)
         };
-        if z_session.is_empty() || z_empty {
-            z_busy.store(false, Ordering::Release);
-            return;
-        }
         let mut z_args = json!({"session_id":z_session,"max_lines":200,"scroll_offset":z_scroll});
         if z_selection || !z_read_view { z_args["events_only"] = json!(true); }
         if let Some(z_seq) = z_after_seq {
@@ -1655,7 +1888,11 @@ fn apply_polled_state(
         Ok(l_value) => l_value,
         Err(err) => {
             // 状态每 500ms 轮询一次, 同一错误不重复刷新, 让消息能按时淡出.
-            let l_text = format!("状态读取失败: {err}");
+            let l_text = if is_en() {
+                format!("Failed to read state: {err}")
+            } else {
+                format!("状态读取失败: {err}")
+            };
             if c_ui.get_status().as_str() != l_text {
                 notify(c_ui, NOTE_ERROR, l_text);
             }
@@ -1667,18 +1904,23 @@ fn apply_polled_state(
     } else {
         c_ui.set_mcp_running(boolean(&z_value["mcp_status"], "running"));
     }
-    let mut z_old = c_state.lock().unwrap();
-    let z_active_connected = array(&z_value, "sessions").iter().any(|c| string(c, "session_id") == c_ui.get_active_session().as_str() && string(c, "status") == "connected");
-    let z_needs_files = if z_active_connected {
-        c_ui.get_remote_listed_session() != c_ui.get_active_session()
-    } else {
-        c_ui.get_remote_ready() || c_ui.get_files().row_count() > 0 || c_ui.get_directory_tree().row_count() > 0
-            || !c_ui.get_file_loading_path().is_empty() || !c_ui.get_tree_loading().is_empty()
-            || !c_ui.get_remote_listed_session().is_empty()
+    let z_prev = {
+        let mut l_old = c_state.lock().unwrap_or_else(PoisonError::into_inner);
+        let l_active_connected = array(&z_value, "sessions").iter().any(|c| string(c, "session_id") == c_ui.get_active_session().as_str() && string(c, "status") == "connected");
+        let l_needs_files = if l_active_connected {
+            c_ui.get_remote_listed_session() != c_ui.get_active_session()
+        } else {
+            c_ui.get_remote_ready() || c_ui.get_files().row_count() > 0 || c_ui.get_directory_tree().row_count() > 0
+                || !c_ui.get_file_loading_path().is_empty() || !c_ui.get_tree_loading().is_empty()
+                || !c_ui.get_remote_listed_session().is_empty()
+        };
+        let l_day_changed = !array(&z_value, "tasks").is_empty() && LAST_LOCAL_DAY.get() != local_today();
+        if *l_old == z_value && !l_needs_files && !l_day_changed && PENDING_UPLOAD_REFRESH.with_borrow(|c| c.is_empty()) {
+            return;
+        }
+        // 在调用任何界面回调前更新快照并释放锁, 避免同步重入 (如 show_session) 时锁冲突.
+        std::mem::replace(&mut *l_old, z_value.clone())
     };
-    if *z_old == z_value && !z_needs_files {
-        return;
-    }
     let z_connected_ids = array(&z_value, "sessions").iter()
         .filter(|c| string(c, "status") == "connected")
         .map(|c| string(c, "session_id")).collect::<Vec<_>>();
@@ -1688,10 +1930,10 @@ fn apply_polled_state(
     for l_session in array(&z_value, "sessions") {
         let l_id = string(l_session, "session_id");
         if let Some(l_terminal) = l_session.get("terminal").and_then(Value::as_u64) {
-            TERMINAL_GEN.lock().unwrap().insert(l_id.to_owned(), l_terminal);
+            TERMINAL_GEN.lock().unwrap_or_else(PoisonError::into_inner).insert(l_id.to_owned(), l_terminal);
         }
         // 新连接的列表已先到达时已在那里作废并重建 (见 list_files 回包), 不再重复清空.
-        if array(&z_old, "sessions").iter().any(|c| string(c, "session_id") == l_id && number(c, "link") != number(l_session, "link"))
+        if array(&z_prev, "sessions").iter().any(|c| string(c, "session_id") == l_id && number(c, "link") != number(l_session, "link"))
             && LISTED_LINK.with_borrow(|c| c.get(l_id).copied()) != l_session.get("link").and_then(Value::as_u64)
         {
             // 后台标签保存的视图快照 (列表、已加载标记、选择) 一并作废, 切回时重新读取.
@@ -1699,46 +1941,122 @@ fn apply_polled_state(
         }
     }
     let mut z_failed = Vec::new();
-    for c_task in array(&z_value, "tasks") {
-        let l_kind = string(c_task, "kind");
-        let l_status = string(c_task, "status");
-        let l_was = |c_status: &str| array(&z_old, "tasks").iter().any(|c_old| string(c_old, "task_id") == string(c_task, "task_id") && string(c_old, "status") == c_status);
+    let z_active_now = c_ui.get_active_session().to_string();
+    let z_browse_now = c_ui.get_browse_path().to_string();
+    let z_upload_running = |c_status: &str| matches!(c_status, "queued" | "preparing" | "running" | "retrying");
+    // 仅统计当前目录的同目录在途上传 (不含 cancelling 和无关 MCP 相对路径任务); 节流时登记待补刷标记, 避免后续失败/取消导致漏刷.
+    let z_more_uploads_here = array(&z_value, "tasks").iter().any(|c_task| {
+        string(c_task, "kind") == "upload"
+            && z_upload_running(string(c_task, "status"))
+            && string(c_task, "session_id") == z_active_now
+            && parent_dir(string(c_task, "label")) == z_browse_now
+    });
+    let z_more_rel_uploads = array(&z_value, "tasks").iter().any(|c_task| {
+        string(c_task, "kind") == "upload"
+            && z_upload_running(string(c_task, "status"))
+            && string(c_task, "session_id") == z_active_now
+            && parent_dir(string(c_task, "label")).is_empty()
+    });
+    for l_task in array(&z_value, "tasks") {
+        let l_kind = string(l_task, "kind");
+        let l_status = string(l_task, "status");
+        let l_was = |c_status: &str| array(&z_prev, "tasks").iter().any(|c_old| string(c_old, "task_id") == string(l_task, "task_id") && string(c_old, "status") == c_status);
         if l_kind == "upload" && l_status == "completed" && !l_was("completed") {
-            invalidate_dirs(c_ui, string(c_task, "session_id"), &[parent_dir(string(c_task, "label"))]);
-            // AI 的上传不抢用户的选择; 用户已切到别的目录时也不跳转.
-            if string(c_task, "source") != "mcp" && parent_dir(string(c_task, "label")) == c_ui.get_browse_path().as_str() {
-                FILE_FOCUS.set(Some((string(c_task, "session_id").to_owned(), string(c_task, "label").to_owned())));
+            let l_sid = string(l_task, "session_id");
+            let l_parent = parent_dir(string(l_task, "label"));
+            if l_parent.is_empty() {
+                // MCP 相对路径上传 (如 "a.txt") 落在远端主目录, 按会话失效缓存以触发刷新.
+                if l_sid == z_active_now && z_more_rel_uploads && !c_ui.get_file_loading_path().is_empty() {
+                    PENDING_UPLOAD_REFRESH.with_borrow_mut(|c| { c.insert((l_sid.to_owned(), String::new())); });
+                } else {
+                    c_ui.invoke_action("invalidate_files".into(), l_sid.into());
+                }
+            } else if l_sid == z_active_now && l_parent == z_browse_now && z_more_uploads_here && !c_ui.get_file_loading_path().is_empty() {
+                FILE_CACHE.with_borrow_mut(|c| c.retain(|c| c.0.0 != l_sid || c.0.1 != l_parent));
+                PENDING_UPLOAD_REFRESH.with_borrow_mut(|c| { c.insert((l_sid.to_owned(), l_parent.clone())); });
+            } else {
+                invalidate_dirs(c_ui, l_sid, &[l_parent.clone()]);
+            }
+            // AI 的上传不抢用户的选择; 必须同时核对会话与目录, 防止后台标签覆盖当前标签待定位文件.
+            if string(l_task, "source") != "mcp" && l_sid == z_active_now && l_parent == z_browse_now {
+                FILE_FOCUS.set(Some((l_sid.to_owned(), string(l_task, "label").to_owned())));
             }
         }
         // 文件夹上传涉及的子目录很多, 失败或取消时也可能已写入部分文件, 结束后让整个会话的目录缓存失效.
-        if l_kind == "upload" && boolean(c_task, "directory") && matches!(l_status, "completed" | "failed" | "cancelled") && !l_was(l_status) {
-            c_ui.invoke_action("invalidate_files".into(), string(c_task, "session_id").into());
+        if l_kind == "upload" && boolean(l_task, "directory") && matches!(l_status, "completed" | "failed" | "cancelled") && !l_was(l_status) {
+            c_ui.invoke_action("invalidate_files".into(), string(l_task, "session_id").into());
         }
         // 传输失败后进度直接从状态栏消失, 不提示容易被当成已完成 (以为下载好了而删掉服务器上的文件), 必须弹窗告知.
         if matches!(l_kind, "upload" | "download") && l_status == "failed" && !l_was("failed") {
-            let l_ai = if string(c_task, "source") == "mcp" { "[AI] " } else { "" };
+            let l_ai = if string(l_task, "source") == "mcp" { "[AI] " } else { "" };
             let (l_from, l_to) = if l_kind == "download" { ("label", "local") } else { ("local", "label") };
-            z_failed.push(format!(
-                "{l_ai}{}失败: {}\n目标位置: {}\n原因: {}",
-                if l_kind == "download" { "下载" } else { "上传" },
-                string(c_task, l_from),
-                string(c_task, l_to),
-                friendly_error(string(c_task, "error")),
-            ));
+            let l_err = friendly_error(string(l_task, "error"));
+            z_failed.push(if is_en() {
+                format!(
+                    "{l_ai}{} failed: {}\nDestination: {}\nReason: {l_err}",
+                    if l_kind == "download" { "Download" } else { "Upload" },
+                    string(l_task, l_from),
+                    string(l_task, l_to),
+                )
+            } else {
+                format!(
+                    "{l_ai}{}失败: {}\n目标位置: {}\n原因: {l_err}",
+                    if l_kind == "download" { "下载" } else { "上传" },
+                    string(l_task, l_from),
+                    string(l_task, l_to),
+                )
+            });
+        }
+    }
+    // 冲刷被节流的待补刷目录: 在途列表已返回、或该目录已无在途上传、或已切走标签时立即补刷, 防止漏刷.
+    let z_loading_now = !c_ui.get_file_loading_path().is_empty();
+    let mut z_flush_refresh = Vec::new();
+    PENDING_UPLOAD_REFRESH.with_borrow_mut(|c_pending| {
+        c_pending.retain(|(l_sid, l_dir)| {
+            let l_still_busy = l_sid == &z_active_now
+                && z_loading_now
+                && if l_dir.is_empty() { z_more_rel_uploads } else { l_dir == &z_browse_now && z_more_uploads_here };
+            if l_still_busy {
+                true
+            } else {
+                z_flush_refresh.push((l_sid.clone(), l_dir.clone()));
+                false
+            }
+        });
+    });
+    for (l_sid, l_dir) in z_flush_refresh {
+        if l_dir.is_empty() {
+            c_ui.invoke_action("invalidate_files".into(), l_sid.into());
+        } else {
+            invalidate_dirs(c_ui, &l_sid, &[l_dir]);
         }
     }
     if !z_failed.is_empty() {
-        notify(c_ui, NOTE_ERROR, format!("{} 个传输任务失败, 详见任务列表", z_failed.len()));
+        notify(
+            c_ui,
+            NOTE_ERROR,
+            if is_en() {
+                format!("{} transfer(s) failed; see Tasks", z_failed.len())
+            } else {
+                format!("{} 个传输任务失败, 详见任务列表", z_failed.len())
+            },
+        );
         alert_transfer_failures(c_runtime, z_failed);
     }
     // 状态栏分工: 左侧为事件消息 (含连接失败原因与重试), 中间只显示当前会话的简短状态, 右侧为传输.
     // 会话刚变为失败时在左侧提示一次.
     for l_session in array(&z_value, "sessions") {
-        let l_reason = session_error(string(l_session, "status"));
+        let l_status = string(l_session, "status");
+        let l_reason = session_error(l_status);
         let l_id = string(l_session, "session_id");
-        let l_was = array(&z_old, "sessions").iter().find(|c| string(c, "session_id") == l_id).map(|c| string(c, "status"));
-        if !l_reason.is_empty() && l_was != Some(string(l_session, "status")) {
-            notify_retry(c_ui, format!("{} 连接失败: {l_reason}", server_label(l_session)), "reconnect", l_id.into());
+        let l_was = array(&z_prev, "sessions").iter().find(|c| string(c, "session_id") == l_id).map(|c| string(c, "status"));
+        if !l_reason.is_empty() && l_was != Some(l_status) {
+            let l_label = if l_status.starts_with("error: 连接已断开:") {
+                t("连接已断开", "Disconnected")
+            } else {
+                t("连接失败", "Connection failed")
+            };
+            notify_retry(c_ui, format!("{} {l_label}: {l_reason}", server_label(l_session)), "reconnect", l_id.into());
         }
     }
     apply_state(c_ui, &z_value, c_answers);
@@ -1760,7 +2078,6 @@ fn apply_polled_state(
         c_ui.set_selected_files_count(0);
         c_ui.set_selected_file_paths(SharedString::default());
     }
-    *z_old = z_value;
 }
 
 // 定时终端结果: 用户切换标签、滚动或正在选择时丢弃迟到画面; 序号未变不重复应用.
@@ -1986,7 +2303,7 @@ fn select_terminal_text(
     c_ui.set_selection_spans(ModelRc::new(VecModel::from(z_spans)));
     c_ui.set_selected_terminal_text(z_selected.into());
     if z_truncated {
-        notify(c_ui, NOTE_WARN, "所选文本最多复制 1 MB, 请分段复制");
+        notify(c_ui, NOTE_WARN, t("所选文本最多复制 1 MB, 请分段复制", "Selection copy limit is 1 MB; copy in smaller chunks"));
     }
 }
 
@@ -2044,7 +2361,15 @@ fn apply_file_selection(c_ui: &AppWindow, c_rows: Vec<FileRow>) {
         c_ui.set_selected_remote(z_paths[0].into());
     }
     if z_paths.len() > 1 {
-        notify(c_ui, NOTE_INFO, format!("已选择 {} 项", z_paths.len()));
+        notify(
+            c_ui,
+            NOTE_INFO,
+            if is_en() {
+                format!("{} items selected", z_paths.len())
+            } else {
+                format!("已选择 {} 项", z_paths.len())
+            },
+        );
     }
     // 只更新行数据, 保留正在响应右键的行和菜单实例.
     let z_model = c_ui.get_files();
@@ -2075,42 +2400,63 @@ fn upload_paths(
     c_limit: usize,
 ) {
     if c_paths.is_empty() || c_paths.len() > c_limit {
-        show_notice(c_weak, NOTE_WARN, format!("一次请选择或拖入 1～{c_limit} 项"));
+        show_notice(
+            c_weak,
+            NOTE_WARN,
+            if is_en() {
+                format!("Select or drop 1 to {c_limit} items")
+            } else {
+                format!("一次请选择或拖入 1～{c_limit} 项")
+            },
+        );
         return;
     }
     let z_backend = c_backend.clone();
     c_runtime.spawn(async move {
         // 拖入上传不经过选择框, 在这里提前建立传输连接; 已建好时立即返回.
         let _ = z_backend.call("warm_transfer", json!({"session_id":c_session,"_link":c_link}), Actor::User).await;
-        for z_path in &c_paths {
-            let Some(_) = z_path
-                .file_name()
-                .and_then(|c| c.to_str())
-                .filter(|c| !c.is_empty() && !c.chars().any(char::is_control))
-            else {
-                show_notice(c_weak, NOTE_WARN, "文件名无效".into());
-                return;
-            };
-            if !z_path.is_file() && !z_path.is_dir() {
-                show_notice(c_weak, NOTE_WARN, "只能上传普通文件或文件夹".into());
-                return;
+        // 校验本地文件名与类型放到阻塞线程并缓存 is_dir, 避免慢速磁盘阻塞 Tokio 工作线程及重复 stat.
+        let z_checked = tokio::task::spawn_blocking(move || -> std::result::Result<Vec<(std::path::PathBuf, String, bool)>, &'static str> {
+            let mut l_items = Vec::with_capacity(c_paths.len());
+            for l_path in c_paths {
+                let Some(l_name) = l_path
+                    .file_name()
+                    .and_then(|c| c.to_str())
+                    .filter(|c| !c.is_empty() && !c.chars().any(char::is_control))
+                    .map(str::to_owned)
+                else {
+                    return Err(t("文件名无效", "Invalid filename"));
+                };
+                let Ok(l_meta) = std::fs::metadata(&l_path) else {
+                    return Err(t("只能上传普通文件或文件夹", "Only regular files and folders can be uploaded"));
+                };
+                if !l_meta.is_file() && !l_meta.is_dir() {
+                    return Err(t("只能上传普通文件或文件夹", "Only regular files and folders can be uploaded"));
+                }
+                l_items.push((l_path, l_name, l_meta.is_dir()));
             }
-        }
-        let mut z_names = c_paths
-            .iter()
-            .map(|c| c.file_name().and_then(|l| l.to_str()).unwrap_or_default().to_owned())
-            .collect::<Vec<_>>();
+            Ok(l_items)
+        })
+        .await;
+        let z_items = match z_checked {
+            Ok(Ok(l_items)) => l_items,
+            Ok(Err(l_msg)) => { show_notice(c_weak, NOTE_WARN, l_msg.into()); return; }
+            Err(_) => { show_notice(c_weak, NOTE_ERROR, t("检查上传源文件异常", "Failed to inspect source files").into()); return; }
+        };
+        let z_paths = z_items.iter().map(|c| c.0.clone()).collect::<Vec<_>>();
+        let z_is_dirs = z_items.iter().map(|c| c.2).collect::<Vec<_>>();
+        let mut z_names = z_items.into_iter().map(|c| c.1).collect::<Vec<_>>();
         // 来自不同目录的同名文件在批次内也会互相冲突, 后者先改名; 之后对最终名称统一检查.
         let mut z_seen = std::collections::HashSet::new();
-        for z_name in &mut z_names {
+        for (z_name, &z_is_dir) in z_names.iter_mut().zip(&z_is_dirs) {
             if !z_seen.insert(z_name.clone()) {
-                *z_name = unique_name(z_name, |c| z_seen.contains(c));
+                *z_name = unique_name(z_name, z_is_dir, |c| z_seen.contains(c));
                 z_seen.insert(z_name.clone());
             }
         }
-        // 只查最终名称是否已存在 (并发查询, 最多等待 6 秒), 不读整个目录; 超时/失败时若目标目录命中界面缓存则回退用缓存文件名提示冲突.
+        // 只查最终名称是否已存在 (并发查询, 最多等待 6 秒), 不读整个目录; 仅超时时回退缓存, 明确断线/重连错误直接提示.
         // 任务仍不带覆盖许可, 由后台再次严格检查防误覆盖.
-        show_notice(c_weak.clone(), NOTE_INFO, "正在检查目标目录中的同名文件...".into());
+        show_notice(c_weak.clone(), NOTE_INFO, t("正在检查目标目录中的同名文件...", "Checking existing files...").into());
         let z_check = tokio::time::timeout(
             Duration::from_secs(6),
             z_backend.call("check_remote_names", json!({"session_id":c_session,"_link":c_link,"directory":c_directory,"names":z_names}), Actor::User),
@@ -2118,7 +2464,20 @@ fn upload_paths(
         .await;
         let mut z_taken = match z_check {
             Ok(Ok(l_value)) => array(&l_value, "existing").iter().filter_map(Value::as_str).map(str::to_owned).collect::<std::collections::HashSet<_>>(),
-            _ => {
+            Ok(Err(err)) => {
+                let l_err = friendly_error(&format!("{err:#}"));
+                show_notice(
+                    c_weak,
+                    NOTE_ERROR,
+                    if is_en() {
+                        format!("Failed to check remote folder: {l_err}")
+                    } else {
+                        format!("检查远端目录失败: {l_err}")
+                    },
+                );
+                return;
+            }
+            Err(_) => {
                 let (l_tx, l_rx) = tokio::sync::oneshot::channel();
                 let (l_sess, l_dir) = (c_session.clone(), c_directory.clone());
                 if c_weak.upgrade_in_event_loop(move |c_ui| {
@@ -2142,7 +2501,8 @@ fn upload_paths(
         let mut z_overwrite = vec![false; z_names.len()];
         let mut z_skip = vec![false; z_names.len()];
         if !z_conflicts.is_empty() {
-            let Some(l_choice) = ask_conflict(c_weak.clone(), &z_conflicts).await else { return; };
+            let l_ctx = if is_en() { c_directory.clone() } else { format!("上传到 {c_directory}") };
+            let Some(l_choice) = ask_conflict(c_weak.clone(), l_ctx, &z_conflicts).await else { return; };
             match l_choice {
                 ConflictChoice::Overwrite => {
                     for (i, z_name) in z_names.iter().enumerate() {
@@ -2155,16 +2515,16 @@ fn upload_paths(
                     }
                 }
                 ConflictChoice::KeepBoth => {
-                    // 保留两者时新名字也不能与已有文件重名: 此时才读取完整目录; 读取失败或超时时仍由后台拒绝重名.
+                    // 保留两者只需已有文件名: names_only 跳过属主/时间查询, 不顶掉当前目录的 file_details 补全槽位.
                     if let Ok(Ok(l_list)) = tokio::time::timeout(
                         Duration::from_secs(6),
-                        z_backend.call("list_files", json!({"session_id":c_session,"_link":c_link,"path":c_directory}), Actor::User),
+                        z_backend.call("list_files", json!({"session_id":c_session,"_link":c_link,"path":c_directory,"names_only":true}), Actor::User),
                     ).await {
                         z_taken.extend(array(&l_list, "entries").iter().map(|l| string(l, "name").to_owned()));
                     }
-                    for z_name in &mut z_names {
+                    for (z_name, &z_is_dir) in z_names.iter_mut().zip(&z_is_dirs) {
                         if z_taken.contains(z_name) {
-                            *z_name = unique_name(z_name, |c| z_taken.contains(c) || z_seen.contains(c));
+                            *z_name = unique_name(z_name, z_is_dir, |c| z_taken.contains(c) || z_seen.contains(c));
                             z_taken.insert(z_name.clone());
                         }
                     }
@@ -2172,30 +2532,31 @@ fn upload_paths(
             }
         }
         let mut z_count = 0;
+        let mut z_failed = 0;
+        let mut z_first_err: Option<anyhow::Error> = None;
         let z_skipped = z_skip.iter().filter(|c| **c).count();
-        for (i, ((z_path, z_name), z_overwrite)) in c_paths.into_iter().zip(z_names).zip(z_overwrite).enumerate() {
+        for (i, (((z_path, z_name), z_overwrite), z_is_dir)) in z_paths.into_iter().zip(z_names).zip(z_overwrite).zip(z_is_dirs).enumerate() {
             if z_skip[i] { continue; }
             let z_remote = format!("{}/{}", c_directory.trim_end_matches('/'), z_name);
             let z_result = z_backend
                 .call(
-                    if z_path.is_dir() { "upload_directory" } else { "upload_file" },
+                    if z_is_dir { "upload_directory" } else { "upload_file" },
                     json!({"session_id":c_session,"_link":c_link,"local_path":z_path,"remote_path":z_remote,"overwrite":z_overwrite}),
                     Actor::User,
                 )
                 .await;
             if let Err(err) = z_result {
-                show_notice(
-                    c_weak,
-                    NOTE_ERROR,
-                    batch_error("上传", z_count, &err),
-                );
-                return;
+                if is_fatal_batch_error(&err) {
+                    show_notice(c_weak, NOTE_ERROR, batch_error(true, z_count, &err));
+                    return;
+                }
+                z_failed += 1;
+                z_first_err.get_or_insert(err);
+                continue;
             }
             z_count += 1;
         }
-        let _ = c_weak.upgrade_in_event_loop(move |c_ui| {
-            notify(&c_ui, NOTE_OK, format!("已加入 {z_count} 个上传任务{}", if z_skipped > 0 { format!(", 已跳过 {z_skipped} 个同名文件") } else { String::new() }))
-        });
+        finish_transfer_batch(c_weak, true, z_count, z_failed, z_skipped, z_first_err);
     });
 }
 
@@ -2244,7 +2605,7 @@ fn toggle_directory_tree(
     }
     if !z_ui.get_tree_loading().is_empty() { return; }
     if z_nodes.len() >= MAX_TREE_NODES || z_depth >= 32 {
-        notify(&z_ui, NOTE_WARN, "目录树已达显示上限, 可直接输入目录路径");
+        notify(&z_ui, NOTE_WARN, t("目录树已达显示上限, 可直接输入目录路径", "Directory tree limit reached; enter a path directly"));
         return;
     }
     let z_session = z_ui.get_active_session().to_string();
@@ -2285,7 +2646,7 @@ fn toggle_directory_tree(
                     refresh_directory_children(&c_ui, &c_path, array(&z_value, "entries"));
                     if c_ui.get_status_retry_arg().as_str() == c_path { c_ui.invoke_dismiss_retry("tree_toggle".into()); }
                     if c_ui.get_directory_tree().row_count() >= MAX_TREE_NODES || boolean(&z_value, "truncated") {
-                        notify(&c_ui, NOTE_WARN, "目录树列表已截断, 可直接输入目录路径");
+                        notify(&c_ui, NOTE_WARN, t("目录树列表已截断, 可直接输入目录路径", "Directory tree truncated; enter a path directly"));
                     }
                 }
                 Err(err) => {
@@ -2298,7 +2659,17 @@ fn toggle_directory_tree(
                         z_nodes[i].expanded = false;
                         c_ui.set_directory_tree(ModelRc::new(VecModel::from(z_nodes)));
                     }
-                    notify_retry(&c_ui, format!("目录加载失败 (已自动重试): {}", friendly_error(&format!("{err:#}"))), "tree_toggle", c_path.into());
+                    let l_err = friendly_error(&format!("{err:#}"));
+                    notify_retry(
+                        &c_ui,
+                        if is_en() {
+                            format!("Failed to load folder (retried): {l_err}")
+                        } else {
+                            format!("目录加载失败 (已自动重试): {l_err}")
+                        },
+                        "tree_toggle",
+                        c_path.into(),
+                    );
                 }
             }
         });
@@ -2361,6 +2732,16 @@ fn focus_uploaded_file(c_ui: &AppWindow, c_session: &str, c_path: &str) {
     c_ui.set_file_scroll_y(row_scroll_offset(z_index, z_files.row_count(), 26.0, c_ui.get_file_view_height()));
 }
 
+// 替换文件列表模型前后把滚动偏移收回到新行数对应的有效范围, 避免批量删除后 ListView 残留旧负偏移把首行裁切一半.
+fn clamp_file_scroll(c_ui: &AppWindow, c_rows: usize) {
+    let z_min = (c_ui.get_file_view_height() - c_rows as f32 * 26.0).min(0.0);
+    let z_cur = c_ui.get_file_scroll_y();
+    let z_clamped = z_cur.clamp(z_min, 0.0);
+    if (z_clamped - z_cur).abs() > 0.01 {
+        c_ui.set_file_scroll_y(z_clamped);
+    }
+}
+
 fn row_scroll_offset(c_index: usize, c_rows: usize, c_row_height: f32, c_view_height: f32) -> f32 {
     let z_above = ((c_view_height * 0.4 - c_row_height / 2.0) / c_row_height).round().max(0.0);
     let z_max = (c_rows as f32 * c_row_height - c_view_height).max(0.0);
@@ -2391,9 +2772,17 @@ fn complete(c_weak: slint::Weak<AppWindow>, c_method: String, c_result: anyhow::
                     "list_files" | "file_details" | "get_task" | "cancel_task" | "connect" | "reconnect" | "new_tab" | "focus_session" | "disconnect"
                         | "open_terminal" | "close_terminal" | "trust_host" | "answer_auth" | "run_command"
                         | "upload_file" | "download_file" | "upload_directory" | "download_directory" | "send_command" | "send_saved_command" | "export_finalshell" | "copy_file"
-                        | "import_finalshell" | "set_terminal_scrollback" | "set_transfer_limits" | "import_commands" | "export_commands" | "move_tab" | "set_expanded_groups" | "set_tab_show_group" | "set_connection_columns"
+                        | "import_finalshell" | "set_terminal_scrollback" | "import_commands" | "export_commands" | "move_tab" | "set_expanded_groups" | "set_tab_show_group" | "set_connection_columns"
                 ) {
-                    notify(&z_ui, NOTE_OK, format!("{}完成", method_label(&c_method)));
+                    notify(
+                        &z_ui,
+                        NOTE_OK,
+                        if is_en() {
+                            format!("{} done", method_label(&c_method))
+                        } else {
+                            format!("{}完成", method_label(&c_method))
+                        },
+                    );
                 }
                 match c_method.as_str() {
                     "save_connection" => z_ui.set_editing(false),
@@ -2422,10 +2811,28 @@ fn complete(c_weak: slint::Weak<AppWindow>, c_method: String, c_result: anyhow::
                         z_ui.set_proxy_editing(false);
                     }
                     "delete_proxy" if number(&z_value, "direct") > 0.0 => {
-                        notify(&z_ui, NOTE_OK, format!("代理已删除, {} 台服务器改为直连", number(&z_value, "direct") as usize));
+                        let l_n = number(&z_value, "direct") as usize;
+                        notify(
+                            &z_ui,
+                            NOTE_OK,
+                            if is_en() {
+                                format!("Proxy deleted; {l_n} host(s) switched to Direct")
+                            } else {
+                                format!("代理已删除, {l_n} 台服务器改为直连")
+                            },
+                        );
                     }
                     "set_connection_proxy" => {
-                        notify(&z_ui, NOTE_OK, format!("已为 {} 台服务器设置代理, 下次连接生效", number(&z_value, "count") as usize));
+                        let l_n = number(&z_value, "count") as usize;
+                        notify(
+                            &z_ui,
+                            NOTE_OK,
+                            if is_en() {
+                                format!("Proxy updated for {l_n} host(s); takes effect next connect")
+                            } else {
+                                format!("已为 {l_n} 台服务器设置代理, 下次连接生效")
+                            },
+                        );
                     }
                     "save_connection_group" | "delete_connection_group" => {
                         z_ui.set_group_editing(false);
@@ -2453,7 +2860,11 @@ fn complete(c_weak: slint::Weak<AppWindow>, c_method: String, c_result: anyhow::
                                 } else {
                                     z_sessions.push(SessionRow {
                                         id: z_id.into(),
-                                        label: if z_empty { "快速连接".into() } else { "连接中".into() },
+                                        label: if z_empty {
+                                            t("快速连接", "Quick Connect").into()
+                                        } else {
+                                            t("连接中", "Connecting").into()
+                                        },
                                         empty: z_empty,
                                         state: if z_empty { 0 } else { 1 },
                                         ..Default::default()
@@ -2469,7 +2880,17 @@ fn complete(c_weak: slint::Weak<AppWindow>, c_method: String, c_result: anyhow::
                                     z_ui.set_active_latency_ms(-1);
                                     z_ui.set_active_state(1);
                                     z_ui.set_active_error(SharedString::default());
+                                    z_ui.set_active_error_detail(SharedString::default());
                                     z_ui.set_active_dropped(false);
+                                    z_ui.set_peer_status(SharedString::default());
+                                    // 发起重连瞬间立即禁用旧文件区交互与拖放, 不等下次 500ms 轮询.
+                                    z_ui.set_remote_ready(false);
+                                    z_ui.set_remote_listed_session(SharedString::default());
+                                    apply_monitor_usage(&z_ui, None);
+                                    if z_ui.get_monitor_expanded() {
+                                        apply_monitor_history(&z_ui, None);
+                                        apply_monitor_processes(&z_ui, None);
+                                    }
                                 }
                                 z_ui.set_managing(false);
                                 // 复用空白标签时 show_session 不会重新激活, 且激活时仍按空标签禁用输入; 状态更新后再交还焦点.
@@ -2482,23 +2903,65 @@ fn complete(c_weak: slint::Weak<AppWindow>, c_method: String, c_result: anyhow::
                         let l_count = array(&z_value, "connections").len();
                         let l_skipped = array(&z_value, "skipped");
                         match l_skipped.first().and_then(Value::as_str) {
-                            Some(l_first) => notify(&z_ui, NOTE_WARN, format!("已导入 {l_count} 条连接, 跳过 {} 条 ({l_first})", l_skipped.len())),
-                            None => notify(&z_ui, NOTE_OK, format!("已导入 {l_count} 条连接")),
+                            Some(l_first) => {
+                                let l_first = friendly_error(l_first);
+                                notify(
+                                    &z_ui,
+                                    NOTE_WARN,
+                                    if is_en() {
+                                        format!("Imported {l_count} host(s), skipped {} ({l_first})", l_skipped.len())
+                                    } else {
+                                        format!("已导入 {l_count} 条连接, 跳过 {} 条 ({l_first})", l_skipped.len())
+                                    },
+                                );
+                            }
+                            None => notify(
+                                &z_ui,
+                                NOTE_OK,
+                                if is_en() {
+                                    format!("Imported {l_count} host(s)")
+                                } else {
+                                    format!("已导入 {l_count} 条连接")
+                                },
+                            ),
                         }
                     }
                     "import_commands" => {
+                        let l_added = number(&z_value, "added") as usize;
                         let l_skipped = number(&z_value, "skipped") as usize;
-                        notify(&z_ui, if l_skipped > 0 { NOTE_WARN } else { NOTE_OK }, format!("已导入 {} 条命令{}", number(&z_value, "added") as usize, if l_skipped > 0 { format!(", 跳过 {l_skipped} 条 (已存在或无效)") } else { String::new() }));
+                        let l_msg = if is_en() {
+                            format!(
+                                "Imported {l_added} command(s){}",
+                                if l_skipped > 0 { format!(", skipped {l_skipped} (duplicate or invalid)") } else { String::new() }
+                            )
+                        } else {
+                            format!(
+                                "已导入 {l_added} 条命令{}",
+                                if l_skipped > 0 { format!(", 跳过 {l_skipped} 条 (已存在或无效)") } else { String::new() }
+                            )
+                        };
+                        notify(&z_ui, if l_skipped > 0 { NOTE_WARN } else { NOTE_OK }, l_msg);
                     }
                     "export_commands" => {
-                        notify(&z_ui, NOTE_OK, format!("已导出 {} 条命令", number(&z_value, "count") as usize));
+                        let l_n = number(&z_value, "count") as usize;
+                        notify(&z_ui, NOTE_OK, if is_en() { format!("Exported {l_n} command(s)") } else { format!("已导出 {l_n} 条命令") });
                     }
                     "set_terminal_scrollback" => {
-                        notify(&z_ui, NOTE_OK, format!("终端历史已设为 {} 行, 新连接生效", number(&z_value, "lines") as u64));
+                        let l_lines = number(&z_value, "lines") as u64;
+                        notify(
+                            &z_ui,
+                            NOTE_OK,
+                            if is_en() {
+                                format!("Scrollback set to {l_lines} lines (new sessions)")
+                            } else {
+                                format!("终端历史已设为 {l_lines} 行, 新连接生效")
+                            },
+                        );
                     }
                     "set_download_dir" => z_ui.set_download_dir(string(&z_value, "path").into()),
                     "export_finalshell" => {
-                        notify(&z_ui, NOTE_OK, format!("已导出 {} 条连接", number(&z_value, "count") as usize));
+                        let l_n = number(&z_value, "count") as usize;
+                        notify(&z_ui, NOTE_OK, if is_en() { format!("Exported {l_n} host(s)") } else { format!("已导出 {l_n} 条连接") });
                     }
                     "file_details" => {
                         if string(&z_value, "session_id") != z_ui.get_active_session().as_str()
@@ -2523,11 +2986,11 @@ fn complete(c_weak: slint::Weak<AppWindow>, c_method: String, c_result: anyhow::
                             z_files.set_row_data(i, l_row);
                         }
                         if !string(&z_value, "server_timezone").is_empty() {
-                            z_ui.set_file_time_label("修改时间 (服务器)".into());
+                            z_ui.set_file_time_label(t("修改时间 (服务器)", "Modified (Server)").into());
                         }
                         cache_file_rows(&z_ui);
                         if !string(&z_value, "time_hint").is_empty() {
-                            notify(&z_ui, NOTE_WARN, string(&z_value, "time_hint"));
+                            notify(&z_ui, NOTE_WARN, friendly_error(string(&z_value, "time_hint")));
                         }
                     }
                     "list_files" => {
@@ -2554,9 +3017,9 @@ fn complete(c_weak: slint::Weak<AppWindow>, c_method: String, c_result: anyhow::
                         if z_ui.get_status_retry_arg().as_str() == z_path { z_ui.invoke_dismiss_retry("tree_toggle".into()); }
                         let z_timezone = string(&z_value, "server_timezone");
                         z_ui.set_file_time_label(if z_timezone.is_empty() {
-                            "修改时间 (UTC)".into()
+                            t("修改时间 (UTC)", "Modified (UTC)").into()
                         } else {
-                            "修改时间 (服务器)".into()
+                            t("修改时间 (服务器)", "Modified (Server)").into()
                         });
                         z_ui.set_selected_remote("".into());
                         z_ui.set_selected_files_count(0);
@@ -2584,7 +3047,7 @@ fn complete(c_weak: slint::Weak<AppWindow>, c_method: String, c_result: anyhow::
                         refresh_directory_children(&z_ui, z_path, array(&z_value, "entries"));
                         scroll_tree_to(&z_ui, z_path);
                         if z_ui.get_directory_tree().row_count() >= MAX_TREE_NODES || z_ancestors.iter().any(|c| boolean(c, "truncated")) {
-                            notify(&z_ui, NOTE_WARN, "目录树列表已截断, 可直接输入目录路径");
+                            notify(&z_ui, NOTE_WARN, t("目录树列表已截断, 可直接输入目录路径", "Directory tree truncated; enter a path directly"));
                         }
                         let z_rows = array(&z_value, "entries")
                             .iter()
@@ -2599,9 +3062,16 @@ fn complete(c_weak: slint::Weak<AppWindow>, c_method: String, c_result: anyhow::
                                 )
                             })
                             .collect::<Vec<_>>();
+                        let z_row_count = z_rows.len();
+                        clamp_file_scroll(&z_ui, z_row_count);
                         z_ui.set_files(ModelRc::new(VecModel::from(z_rows)));
+                        clamp_file_scroll(&z_ui, z_row_count);
                         cache_file_rows(&z_ui);
-                        if let Some((l_session, l_path)) = FILE_FOCUS.take() {
+                        let z_has_pending = PENDING_UPLOAD_REFRESH.with_borrow(|c| {
+                            let l_sid = z_ui.get_active_session().to_string();
+                            c.contains(&(l_sid.clone(), z_path.to_owned())) || c.contains(&(l_sid, String::new()))
+                        });
+                        if !z_has_pending && let Some((l_session, l_path)) = FILE_FOCUS.take() {
                             focus_uploaded_file(&z_ui, &l_session, &l_path);
                         }
                         // 属主与时间仍在后台查询: 取到后就地更新这两列, 不重读目录.
@@ -2609,10 +3079,10 @@ fn complete(c_weak: slint::Weak<AppWindow>, c_method: String, c_result: anyhow::
                             z_ui.invoke_action("file_details".into(), l_token.to_string().into());
                         }
                         if !string(&z_value, "time_hint").is_empty() {
-                            notify(&z_ui, NOTE_WARN, string(&z_value, "time_hint"));
+                            notify(&z_ui, NOTE_WARN, friendly_error(string(&z_value, "time_hint")));
                         }
                         if boolean(&z_value, "truncated") {
-                            notify(&z_ui, NOTE_WARN, "远端列表已达显示上限, 请进入更具体的目录");
+                            notify(&z_ui, NOTE_WARN, t("远端列表已达显示上限, 请进入更具体的目录", "Remote listing truncated; open a subfolder"));
                         }
                     }
                     "get_task" => {
@@ -2627,7 +3097,8 @@ fn complete(c_weak: slint::Weak<AppWindow>, c_method: String, c_result: anyhow::
                         }
                     }
                     "copy_file" => {
-                        notify(&z_ui, NOTE_OK, format!("已创建副本 {}", string(&z_value, "path")));
+                        let l_path = string(&z_value, "path");
+                        notify(&z_ui, NOTE_OK, if is_en() { format!("Duplicated as {l_path}") } else { format!("已创建副本 {l_path}") });
                         if string(&z_value, "session_id") == z_ui.get_active_session().as_str() {
                             z_ui.invoke_action("list_files".into(), z_ui.get_browse_path());
                         }
@@ -2668,7 +3139,13 @@ fn complete(c_weak: slint::Weak<AppWindow>, c_method: String, c_result: anyhow::
                             // 全部失败时不写"0 项已删除"; 失败项仍留在对话框列表中.
                             let z_done = z_results.len() - z_failed.len();
                             z_ui.set_file_operation_error(
-                                if z_done == 0 {
+                                if is_en() {
+                                    if z_done == 0 {
+                                        format!("Delete failed: {z_error}")
+                                    } else {
+                                        format!("{z_done} deleted, {} failed: {z_error}", z_failed.len())
+                                    }
+                                } else if z_done == 0 {
                                     format!("删除失败: {z_error}")
                                 } else {
                                     format!("{z_done} 项已删除, {} 项失败: {z_error}", z_failed.len())
@@ -2692,7 +3169,7 @@ fn complete(c_weak: slint::Weak<AppWindow>, c_method: String, c_result: anyhow::
                     "run_command" => {
                         if let Some(z_id) = z_value.get("task_id").and_then(Value::as_str) {
                             z_ui.set_selected_task(z_id.into());
-                            z_ui.set_task_output("命令已进入队列, 等待输出...".into());
+                            z_ui.set_task_output(t("命令已进入队列, 等待输出...", "Command queued, waiting for output...").into());
                             z_ui.set_bottom_page(2);
                         }
                     }
@@ -2703,12 +3180,20 @@ fn complete(c_weak: slint::Weak<AppWindow>, c_method: String, c_result: anyhow::
                 // 补全失败不影响已显示的列表, 属主与时间保持数字 ID 与 UTC.
                 if c_method == "file_details" { return; }
                 // 带上完整原因链 (如"打开 SFTP 通道失败: 等待服务器响应超时"), 只显示最外层说明看不出真正原因.
-                let z_message = format!("{}失败: {}", method_label(&c_method), friendly_error(&format!("{err:#}")));
+                let z_err = friendly_error(&format!("{err:#}"));
+                let z_message = if is_en() {
+                    format!("{} failed: {z_err}", method_label(&c_method))
+                } else {
+                    format!("{}失败: {z_err}", method_label(&c_method))
+                };
                 // 错误显示在仍打开的对话框里时不再发到状态栏, 免得对话框关闭后状态栏还留着同一条错误.
                 let mut z_in_dialog = false;
-                if matches!(c_method.as_str(), "save_connection" | "save_saved_command" | "save_command_group" | "save_connection_group" | "save_proxy") {
+                if c_method == "save_proxy" {
+                    z_ui.set_proxy_form_error(z_message.chars().take(200).collect::<String>().into());
+                    z_in_dialog = z_ui.get_proxy_editing();
+                } else if matches!(c_method.as_str(), "save_connection" | "save_saved_command" | "save_command_group" | "save_connection_group") {
                     z_ui.set_form_error(z_message.chars().take(200).collect::<String>().into());
-                    z_in_dialog = z_ui.get_editing() || z_ui.get_command_editing() || z_ui.get_group_editing() || z_ui.get_proxy_editing();
+                    z_in_dialog = z_ui.get_editing() || z_ui.get_command_editing() || z_ui.get_group_editing();
                 }
                 if matches!(
                     c_method.as_str(),
@@ -2727,9 +3212,10 @@ fn complete(c_weak: slint::Weak<AppWindow>, c_method: String, c_result: anyhow::
                 if c_method == "list_files" {
                     let z_session = z_ui.get_active_session().to_string();
                     let z_path = z_ui.get_browse_path().to_string();
-                    z_ui.set_file_error(friendly_error(&format!("{err:#}")).into());
+                    z_ui.set_file_error(z_err.into());
                     z_ui.set_file_error_key(format!("{z_session}\n{z_path}").into());
                     FILE_CACHE.with_borrow_mut(|c| c.retain(|c| c.0 != (z_session.clone(), z_path.clone())));
+                    z_ui.set_file_scroll_y(0.0);
                     z_ui.set_files(ModelRc::default());
                     z_ui.set_remote_ready(false);
                     notify_retry(&z_ui, z_message, "list_files", z_ui.get_browse_path());
@@ -2741,9 +3227,49 @@ fn complete(c_weak: slint::Weak<AppWindow>, c_method: String, c_result: anyhow::
     });
 }
 
+// 切换语言后立即重建 Rust 侧已写入界面的状态文本与列表数据.
+fn refresh_language_ui(c_ui: &AppWindow, c_state: &Value, c_answers: &Arc<Mutex<Vec<String>>>) {
+    if !c_state.is_null() {
+        apply_state(c_ui, c_state, c_answers);
+        apply_mcp_status(c_ui, &c_state["mcp_status"]);
+    } else if c_ui.get_editing() {
+        refresh_edit_proxy_choices(c_ui);
+    }
+    let z_status = c_ui.get_status();
+    if matches!(z_status.as_str(), "就绪" | "Ready") {
+        c_ui.set_status(t("就绪", "Ready").into());
+    } else if !z_status.is_empty() && is_en() {
+        c_ui.set_status(friendly_error(z_status.as_str()).into());
+    }
+    c_ui.set_file_time_label(localize_file_time_label(c_ui.get_file_time_label().as_str()).into());
+    let z_files = c_ui.get_files();
+    if z_files.row_count() > 0 {
+        let l_rows = localize_file_rows(z_files.iter());
+        c_ui.set_files(update_rows(z_files, l_rows));
+    }
+    if !c_ui.get_terminal_size_text().is_empty() {
+        c_ui.set_terminal_size_text(
+            format_terminal_size(c_ui.get_terminal_cols(), c_ui.get_terminal_rows()).into(),
+        );
+    }
+    if !c_ui.get_mcp_url().is_empty() {
+        c_ui.set_mcp_prompt(
+            build_mcp_prompt(c_ui.get_mcp_url().as_str(), c_ui.get_mcp_config().as_str()).into(),
+        );
+    }
+    MCP_CHECK_GEN.fetch_add(1, Ordering::AcqRel);
+    c_ui.set_mcp_checking(false);
+    c_ui.set_mcp_check_title(SharedString::default());
+    c_ui.set_mcp_check_detail(SharedString::default());
+    let z_selected_task = c_ui.get_selected_task();
+    if !z_selected_task.is_empty() {
+        c_ui.invoke_action("get_task".into(), z_selected_task);
+    }
+}
+
 fn apply_state(c_ui: &AppWindow, c_state: &Value, c_answers: &Arc<Mutex<Vec<String>>>) {
-    if c_ui.get_status().as_str() == "正在加载连接..." {
-        notify(c_ui, NOTE_INFO, "就绪");
+    if matches!(c_ui.get_status().as_str(), "正在加载连接..." | "Loading hosts...") {
+        notify(c_ui, NOTE_INFO, t("就绪", "Ready"));
     }
     let z_proxies = array(c_state, "proxies");
     c_ui.set_proxies(update_rows(
@@ -2776,11 +3302,16 @@ fn apply_state(c_ui: &AppWindow, c_state: &Value, c_answers: &Arc<Mutex<Vec<Stri
                 proxy_id: string(c_item, "proxy_id").into(),
                 // 名称只用于显示, 是否直连、当前选中哪个代理一律按 proxy_id 判断.
                 proxy: match string(c_item, "proxy_id") {
-                    "" => "直连",
-                    l_id => z_proxies.iter().find(|c| string(c, "id") == l_id).map(|c| string(c, "name")).unwrap_or("代理已删除"),
+                    "" => t("直连", "Direct"),
+                    l_id => z_proxies.iter().find(|c| string(c, "id") == l_id).map(|c| string(c, "name")).unwrap_or(t("代理已删除", "Deleted proxy")),
                 }
                 .into(),
-                auth: match string(c_item, "auth") { "private_key" => "私钥", "keyboard_interactive" => "交互", _ => "密码" }.into(),
+                auth: match string(c_item, "auth") {
+                    "private_key" => t("私钥", "Key"),
+                    "keyboard_interactive" => t("交互", "Interactive"),
+                    _ => t("密码", "Password"),
+                }
+                .into(),
                 host: string(c_item, "host").into(),
                 port: number(c_item, "port").to_string().into(),
                 username: string(c_item, "username").into(),
@@ -2847,9 +3378,9 @@ fn apply_state(c_ui: &AppWindow, c_state: &Value, c_answers: &Arc<Mutex<Vec<Stri
                     name: string(c_item, "name").into(),
                     // 标签名不含分组, 界面按设置在前面加 [分组].
                     label: match l_state {
-                        _ if boolean(c_item, "empty") => "快速连接".into(),
+                        _ if boolean(c_item, "empty") => t("快速连接", "Quick Connect").into(),
                         2 => string(c_item, "name").into(),
-                        3 => format!("{} · 仅文件", string(c_item, "name")).into(),
+                        3 => format!("{} · {}", string(c_item, "name"), t("仅文件", "Files Only")).into(),
                         _ => format!("{} · {}", string(c_item, "name"), status_label(l_status)).into(),
                     },
                     group: match string(c_item, "group") {
@@ -2874,60 +3405,7 @@ fn apply_state(c_ui: &AppWindow, c_state: &Value, c_answers: &Arc<Mutex<Vec<Stri
         c_ui.invoke_action("show_session".into(), z_id.into());
     }
     let z_active = c_ui.get_active_session();
-    let z_session = array(c_state, "sessions")
-        .iter()
-        .find(|c_item| string(c_item, "session_id") == z_active.as_str());
-    let z_raw_status = z_session.map(|c| string(c, "status")).unwrap_or_default();
-    let z_state_code = z_session.map(session_state).unwrap_or(0);
-    let z_err = session_error(z_raw_status);
-    c_ui.set_active_session_empty(z_session.is_none_or(|c| boolean(c, "empty")));
-    c_ui.set_active_connected(z_raw_status == "connected");
-    c_ui.set_active_state(z_state_code);
-    c_ui.set_active_dropped(z_raw_status.starts_with("error: 连接已断开:"));
-    c_ui.set_active_connection_id(z_session.map(|c| string(c, "connection_id")).unwrap_or_default().into());
-    c_ui.set_active_latency_ms(
-        z_session
-            .filter(|c| string(c, "status") == "connected")
-            .and_then(|c| c.get("latency_ms"))
-            .and_then(Value::as_i64)
-            .map(|c| c.clamp(0, i32::MAX as i64) as i32)
-            .unwrap_or(-1),
-    );
-    if z_state_code == 3 && z_err.is_empty() && c_ui.get_terminal_text().starts_with("终端打开失败:") {
-        c_ui.set_active_error(c_ui.get_terminal_text().trim().into());
-    } else {
-        c_ui.set_active_error(z_err.into());
-    }
-    c_ui.set_peer_status(
-        z_session
-            .map(|c| {
-                if boolean(c, "empty") {
-                    "快速连接".into()
-                } else {
-                    format!("{} · {}", server_label(c), status_label(string(c, "status")))
-                }
-            })
-            .unwrap_or_else(|| "未连接".into())
-            .into(),
-    );
-    // 侧栏标题: 当前标签的服务器名称与地址.
-    let z_host = z_session
-        .and_then(|c| array(c_state, "connections").iter().find(|l| string(l, "id") == string(c, "connection_id")))
-        .map(|c| format!("{}@{}:{}", string(c, "username"), string(c, "host"), number(c, "port")))
-        .unwrap_or_default();
-    c_ui.set_monitor_server_name(z_session.filter(|c| !boolean(c, "empty")).map(server_label).unwrap_or_default().into());
-    c_ui.set_monitor_server_host(z_host.into());
-    c_ui.set_monitor_text(
-        z_session
-            .map(monitor_text)
-            .unwrap_or_else(|| "尚未连接".into())
-            .into(),
-    );
-    if c_ui.get_monitor_expanded() {
-        apply_monitor_history(c_ui, z_session);
-        apply_monitor_processes(c_ui, z_session);
-    }
-    apply_monitor_usage(c_ui, z_session);
+    apply_active_session(c_ui, c_state, z_active.as_str());
     c_ui.set_quick_commands(update_rows(c_ui.get_quick_commands(),
         array(c_state, "quick_commands")
             .iter()
@@ -2947,12 +3425,19 @@ fn apply_state(c_ui: &AppWindow, c_state: &Value, c_answers: &Arc<Mutex<Vec<Stri
     }
     apply_visible_commands(c_ui);
     if !string(c_state, "quick_commands_error").is_empty() {
-        let l_text = format!("读取常用命令失败: {}", string(c_state, "quick_commands_error"));
+        let l_err = string(c_state, "quick_commands_error");
+        let l_text = if is_en() {
+            format!("Failed to load commands: {l_err}")
+        } else {
+            format!("读取常用命令失败: {l_err}")
+        };
         if c_ui.get_status().as_str() != l_text {
             notify(c_ui, NOTE_ERROR, l_text);
         }
     }
     let z_tasks = array(c_state, "tasks");
+    let z_today = local_today();
+    LAST_LOCAL_DAY.set(z_today);
     let z_task_connections = array(c_state, "connections").iter().map(|c| (string(c, "id"), c)).collect::<HashMap<_, _>>();
     c_ui.set_tasks(update_rows(c_ui.get_tasks(),
         z_tasks
@@ -2962,7 +3447,7 @@ fn apply_state(c_ui: &AppWindow, c_state: &Value, c_answers: &Arc<Mutex<Vec<Stri
                 let l_bytes = number(c_item, "bytes");
                 let l_status = string(c_item, "status");
                 let l_connection = z_task_connections.get(string(c_item, "connection_id")).copied();
-                let l_machine = l_connection.map(server_label).unwrap_or_else(|| "连接已删除".into());
+                let l_machine = l_connection.map(server_label).unwrap_or_else(|| t("连接已删除", "Deleted host").into());
                 let l_ratio = if l_total > 0.0 { (l_bytes / l_total).clamp(0.0, 1.0) } else { -1.0 };
                 let l_pct = l_ratio.max(0.0) * 100.0;
                 let l_speed = number(c_item, "speed_bytes_per_sec");
@@ -2972,6 +3457,17 @@ fn apply_state(c_ui: &AppWindow, c_state: &Value, c_answers: &Arc<Mutex<Vec<Stri
                 let l_files = number(c_item, "files_total");
                 let l_file_bytes = number(c_item, "file_bytes");
                 let l_file_total = number(c_item, "file_total");
+                let l_time: SharedString = if task_active(l_status) {
+                    SharedString::default()
+                } else {
+                    c_item
+                        .get("finished_at_ms")
+                        .and_then(Value::as_u64)
+                        .or_else(|| c_item.get("created_at_ms").and_then(Value::as_u64))
+                        .map(|c| format_task_time(c, z_today))
+                        .unwrap_or_default()
+                        .into()
+                };
                 TaskRow {
                     id: string(c_item, "task_id").into(),
                     // 传输只显示文件名 (方向由图标表示), 完整路径在右侧详情中.
@@ -2985,8 +3481,8 @@ fn apply_state(c_ui: &AppWindow, c_state: &Value, c_answers: &Arc<Mutex<Vec<Stri
                     // AI 任务显示发起的客户端名称, 多个 AI 同时工作时可区分.
                     source: match (string(c_item, "source"), string(c_item, "client")) {
                         ("mcp", "") => "LLM".into(),
-                        ("mcp", l_client) => l_client.chars().take(16).collect::<String>().into(),
-                        _ => "用户".into(),
+                        ("mcp", l_client) => i18n::display_client(l_client).chars().take(16).collect::<String>().into(),
+                        _ => t("用户", "User").into(),
                     },
                     kind: match string(c_item, "kind") { "upload" => 1, "download" => 2, _ => 0 },
                     // 0 进行中/排队, 1 成功, 2 失败 (含非零退出码), 3 已取消.
@@ -2998,9 +3494,9 @@ fn apply_state(c_ui: &AppWindow, c_state: &Value, c_answers: &Arc<Mutex<Vec<Stri
                         _ => 0,
                     },
                     status: match l_exit {
-                        Some(l_code) if l_command => format!("{} · 退出码 {l_code}", status_label(l_status)),
+                        Some(l_code) if l_command => format!("{} · {} {l_code}", status_label(l_status), t("退出码", "Exit")),
                         _ if !l_command && l_status == "running" && boolean(c_item, "main_link") => {
-                            format!("{} · 主连接", status_label(l_status))
+                            format!("{} · {}", status_label(l_status), t("主连接", "Main Link"))
                         }
                         _ => status_label(l_status).to_string(),
                     }
@@ -3009,36 +3505,57 @@ fn apply_state(c_ui: &AppWindow, c_state: &Value, c_answers: &Arc<Mutex<Vec<Stri
                         _ if l_command => SharedString::default(),
                         "completed" => format!(
                             "{}{}{}",
-                            if l_directory { format!("{l_files:.0} 个文件 · ") } else { String::new() },
+                            if l_directory {
+                                if is_en() { format!("{l_files:.0} files · ") } else { format!("{l_files:.0} 个文件 · ") }
+                            } else {
+                                String::new()
+                            },
                             format_bytes(l_bytes),
-                            if string(c_item, "stderr").is_empty() { "" } else { " · 有跳过项" },
+                            if number(c_item, "stderr_bytes") == 0.0 { "" } else { t(" · 有跳过项", " · skipped") },
                         ).into(),
                         "queued" | "preparing" if l_directory && l_files == 0.0 => SharedString::default(),
-                        "queued" | "preparing" if l_directory =>
-                            format!("{l_files:.0} 个文件{}", if l_total > 0.0 { format!(" · {}", format_bytes(l_total)) } else { String::new() }).into(),
+                        "queued" | "preparing" if l_directory => format!(
+                            "{}{}",
+                            if is_en() { format!("{l_files:.0} files") } else { format!("{l_files:.0} 个文件") },
+                            if l_total > 0.0 { format!(" · {}", format_bytes(l_total)) } else { String::new() }
+                        ).into(),
                         "queued" | "preparing" if l_total > 0.0 => format_bytes(l_total).into(),
                         "running" if l_directory => format!(
                             "{:.0}/{l_files:.0} · {}{l_pct:.0}%",
-                            (number(c_item, "files_done") + 1.0).min(l_files),
+                            (number(c_item, "files_done") + number(c_item, "files_failed") + 1.0).min(l_files),
                             if l_speed > 0.0 { format!("{}/s · ", format_bytes(l_speed)) } else { String::new() },
                         ).into(),
                         "retrying" if l_total > 0.0 => format!("{l_pct:.0}%").into(),
                         "retrying" if l_bytes > 0.0 => format_bytes(l_bytes).into(),
-                        "running" if l_speed > 0.0 && l_total > l_bytes =>
-                            format!("{l_pct:.0}% · {}/s · 剩 {}", format_bytes(l_speed), format_eta((l_total - l_bytes) / l_speed)).into(),
+                        "running" if l_speed > 0.0 && l_total > l_bytes => {
+                            let l_eta = format_eta((l_total - l_bytes) / l_speed);
+                            if is_en() {
+                                format!("{l_pct:.0}% · {}/s · {l_eta} left", format_bytes(l_speed))
+                            } else {
+                                format!("{l_pct:.0}% · {}/s · 剩 {l_eta}", format_bytes(l_speed))
+                            }
+                            .into()
+                        }
                         "running" if l_total > 0.0 => format!("{l_pct:.0}% · {}", format_bytes(l_total)).into(),
                         "running" if l_speed > 0.0 => format!("{} · {}/s", format_bytes(l_bytes), format_bytes(l_speed)).into(),
                         "running" => format_bytes(l_bytes).into(),
                         _ => SharedString::default(),
                     },
+                    time: l_time,
                     ratio: if l_directory {
-                        if l_status == "running" && l_file_total > 0.0 { (l_file_bytes / l_file_total).clamp(0.0, 1.0) as f32 } else { -1.0 }
+                        // 文件夹进度条与百分比统一按整体字节计算 (总字节未知或全 0 字节时回退单文件进度), 避免遇 0 字节文件抖动.
+                        if l_status == "running" {
+                            if l_total > 0.0 { l_ratio as f32 } else if l_file_total > 0.0 { (l_file_bytes / l_file_total).clamp(0.0, 1.0) as f32 } else { -1.0 }
+                        } else {
+                            -1.0
+                        }
                     } else if l_command {
                         -1.0
                     } else {
                         l_ratio as f32
                     },
-                    cancellable: task_active(l_status),
+                    running_plain: l_status == "running" && !boolean(c_item, "main_link"),
+                    cancellable: task_active(l_status) && l_status != "cancelling",
                     local: string(c_item, "local").into(),
                 }
             })
@@ -3070,13 +3587,12 @@ fn apply_state(c_ui: &AppWindow, c_state: &Value, c_answers: &Arc<Mutex<Vec<Stri
     // 认证弹窗只在提示变化时重建, 避免刷新清空正在输入的密码. 请求标识随回答带回, 换了一轮请求 (文字相同也算) 就重建.
     let z_request = z_auth.map(|c_item| string(c_item, "auth_id")).unwrap_or("");
     let z_old_prompts = c_ui.get_prompts();
-    use slint::Model;
     let z_changed = c_ui.get_auth_session().as_str() != z_auth_id
         || AUTH_REQUEST.with_borrow(|c| c != z_request)
         || z_old_prompts.row_count() != z_prompts.len()
         || z_prompts.iter().enumerate().any(|(i, c_item)| {
             z_old_prompts.row_data(i).is_none_or(|l_old| {
-                l_old.prompt.as_str() != string(c_item, "prompt")
+                l_old.prompt.as_str() != i18n::localize_auth_prompt(string(c_item, "prompt"))
                     || l_old.echo != boolean(c_item, "echo")
             })
         });
@@ -3091,7 +3607,7 @@ fn apply_state(c_ui: &AppWindow, c_state: &Value, c_answers: &Arc<Mutex<Vec<Stri
             z_prompts
                 .iter()
                 .map(|c_item| PromptRow {
-                    prompt: string(c_item, "prompt").into(),
+                    prompt: i18n::localize_auth_prompt(string(c_item, "prompt")).into(),
                     echo: boolean(c_item, "echo"),
                 })
                 .collect::<Vec<_>>(),
@@ -3099,6 +3615,70 @@ fn apply_state(c_ui: &AppWindow, c_state: &Value, c_answers: &Arc<Mutex<Vec<Stri
         c_ui.set_auth_session(z_auth_id.into());
         AUTH_REQUEST.with_borrow_mut(|c| *c = z_request.to_owned());
     }
+}
+
+fn apply_active_session(c_ui: &AppWindow, c_state: &Value, c_active: &str) {
+    let z_session = array(c_state, "sessions")
+        .iter()
+        .find(|c_item| string(c_item, "session_id") == c_active);
+    let z_raw_status = z_session.map(|c| string(c, "status")).unwrap_or_default();
+    let z_state_code = z_session.map(session_state).unwrap_or(0);
+    let z_err = session_error(z_raw_status);
+    c_ui.set_active_session_empty(z_session.is_none_or(|c| boolean(c, "empty")));
+    c_ui.set_active_connected(z_raw_status == "connected");
+    c_ui.set_active_state(z_state_code);
+    c_ui.set_active_dropped(z_raw_status.starts_with("error: 连接已断开:"));
+    c_ui.set_active_connection_id(z_session.map(|c| string(c, "connection_id")).unwrap_or_default().into());
+    c_ui.set_active_latency_ms(
+        z_session
+            .filter(|c| string(c, "status") == "connected")
+            .and_then(|c| c.get("latency_ms"))
+            .and_then(Value::as_i64)
+            .map(|c| c.clamp(0, i32::MAX as i64) as i32)
+            .unwrap_or(-1),
+    );
+    if z_state_code == 3 && z_err.is_empty() && c_ui.get_terminal_text().starts_with("终端打开失败:") {
+        c_ui.set_active_error(friendly_error(c_ui.get_terminal_text().trim()).into());
+        c_ui.set_active_error_detail(SharedString::default());
+    } else {
+        c_ui.set_active_error(z_err.into());
+        c_ui.set_active_error_detail(
+            z_session
+                .map(|c| i18n::localize_disconnect_detail(string(c, "disconnect_detail")))
+                .unwrap_or_default()
+                .into(),
+        );
+    }
+    c_ui.set_peer_status(
+        z_session
+            .map(|c| {
+                if boolean(c, "empty") {
+                    t("快速连接", "Quick Connect").into()
+                } else {
+                    format!("{} · {}", server_label(c), status_label(string(c, "status")))
+                }
+            })
+            .unwrap_or_else(|| t("未连接", "Not connected").into())
+            .into(),
+    );
+    // 侧栏标题: 当前标签的服务器名称与地址.
+    let z_host = z_session
+        .and_then(|c| array(c_state, "connections").iter().find(|l| string(l, "id") == string(c, "connection_id")))
+        .map(|c| format!("{}@{}:{}", string(c, "username"), string(c, "host"), number(c, "port")))
+        .unwrap_or_default();
+    c_ui.set_monitor_server_name(z_session.filter(|c| !boolean(c, "empty")).map(server_label).unwrap_or_default().into());
+    c_ui.set_monitor_server_host(z_host.into());
+    c_ui.set_monitor_text(
+        z_session
+            .map(monitor_text)
+            .unwrap_or_else(|| t("尚未连接", "Not connected").into())
+            .into(),
+    );
+    if c_ui.get_monitor_expanded() {
+        apply_monitor_history(c_ui, z_session);
+        apply_monitor_processes(c_ui, z_session);
+    }
+    apply_monitor_usage(c_ui, z_session);
 }
 
 // 刷新字体候选 (仅已安装) 与可下载字体的状态.
@@ -3131,21 +3711,21 @@ fn apply_mcp_status(c_ui: &AppWindow, c_mcp: &Value) {
             let l_seconds = z_now.saturating_sub(c.get("at_ms").and_then(Value::as_u64).unwrap_or(0)) / 1000;
             McpActivityRow {
                 time: match l_seconds {
-                    0..5 => "刚刚".into(),
-                    5..60 => format!("{l_seconds} 秒前").into(),
-                    60..3600 => format!("{} 分钟前", l_seconds / 60).into(),
-                    _ => format!("{} 小时前", l_seconds / 3600).into(),
+                    0..5 => t("刚刚", "just now").into(),
+                    5..60 => if is_en() { format!("{l_seconds}s ago") } else { format!("{l_seconds} 秒前") }.into(),
+                    60..3600 => if is_en() { format!("{}m ago", l_seconds / 60) } else { format!("{} 分钟前", l_seconds / 60) }.into(),
+                    _ => if is_en() { format!("{}h ago", l_seconds / 3600) } else { format!("{} 小时前", l_seconds / 3600) }.into(),
                 },
                 // 第一行 "动作 · 客户端", 第二行对象; 动作名带出在主终端还是独立执行.
                 label: format!(
                     "{} · {}",
                     mcp_action(string(c, "method")).0,
-                    match string(c, "client") { "" => "AI", l_client => client_name(l_client) }
+                    match string(c, "client") { "" => "AI", l_client => i18n::display_client(client_name(l_client)) }
                 )
                 .into(),
-                detail: string(c, "detail").into(),
-                info: string(c, "info").into(),
-                error: string(c, "error").into(),
+                detail: i18n::localize_mcp_detail(string(c, "detail")).into(),
+                info: i18n::localize_mcp_info(string(c, "method"), string(c, "info")).into(),
+                error: friendly_error(string(c, "error")).into(),
                 risk: mcp_action(string(c, "method")).1,
                 ok: boolean(c, "ok"),
             }
@@ -3230,8 +3810,9 @@ fn apply_terminal(c_ui: &AppWindow, c_value: &Value) {
     c_ui.set_mouse_tracking(number(c_value, "mouse_tracking") as i32);
     c_ui.set_terminal_text(z_text.into());
     if c_ui.get_active_state() == 3 {
+        c_ui.set_active_error_detail(SharedString::default());
         if z_text.starts_with("终端打开失败:") {
-            c_ui.set_active_error(z_text.trim().into());
+            c_ui.set_active_error(friendly_error(z_text.trim()).into());
         } else {
             c_ui.set_active_error(SharedString::default());
         }
@@ -3365,10 +3946,11 @@ fn apply_visible_commands(c_ui: &AppWindow) {
 fn file_row(c_item: &Value, c_path: String) -> FileRow {
     let z_dir = boolean(c_item, "is_dir");
     let z_name = string(c_item, "name");
-    let z_kind = match string(c_item, "kind") {
-        "directory" => "文件夹",
-        "symlink" => "链接",
-        _ => "文件",
+    let z_raw_kind = string(c_item, "kind");
+    let z_kind = match z_raw_kind {
+        "directory" => t("文件夹", "Folder"),
+        "symlink" => t("链接", "Link"),
+        _ => t("文件", "File"),
     };
     let z_size = if z_dir {
         "—".into()
@@ -3381,7 +3963,7 @@ fn file_row(c_item: &Value, c_path: String) -> FileRow {
         directory: z_dir,
         selected: false,
         name: z_name.into(),
-        icon: if z_dir { 0 } else if z_kind == "链接" { 8 } else {
+        icon: if z_dir { 0 } else if z_raw_kind == "symlink" { 8 } else {
             match z_name.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str() {
                 "txt" | "md" | "log" | "csv" | "rst" => 3,
                 "rs" | "py" | "js" | "ts" | "html" | "css" | "c" | "cpp" | "go" | "java" | "sh" | "bash" | "zsh" => 4,
@@ -3416,14 +3998,12 @@ fn file_row(c_item: &Value, c_path: String) -> FileRow {
     }
 }
 
-fn format_file_time(c_seconds: Option<u64>) -> String {
-    let Some(z_seconds) = c_seconds.filter(|c| *c <= 253_402_300_799) else {
-        return "—".into();
-    };
+fn utc_datetime(c_seconds: u64) -> (i32, u32, u32, u32, u32, u32) {
     // UTC公历换算, 不引入日期库; 纪元平移到3月, 使闰日落在每年的末尾.
+    let z_seconds = c_seconds.min(253_402_300_799);
     let z_days = (z_seconds / 86_400) as i64 + 719_468;
-    let z_era = z_days / 146_097;
-    let z_day_of_era = z_days - z_era * 146_097;
+    let z_era = z_days.div_euclid(146_097);
+    let z_day_of_era = z_days.rem_euclid(146_097);
     let z_year_of_era = (z_day_of_era - z_day_of_era / 1_460 + z_day_of_era / 36_524
         - z_day_of_era / 146_096)
         / 365;
@@ -3434,11 +4014,134 @@ fn format_file_time(c_seconds: Option<u64>) -> String {
     let z_day = z_day_of_year - (153 * z_month_index + 2) / 5 + 1;
     let z_month = z_month_index + if z_month_index < 10 { 3 } else { -9 };
     z_year += i64::from(z_month <= 2);
-    format!(
-        "{z_year:04}-{z_month:02}-{z_day:02} {:02}:{:02}",
-        z_seconds % 86_400 / 3_600,
-        z_seconds % 3_600 / 60
+    (
+        z_year as i32,
+        z_month as u32,
+        z_day as u32,
+        (z_seconds % 86_400 / 3_600) as u32,
+        (z_seconds % 3_600 / 60) as u32,
+        (z_seconds % 60) as u32,
     )
+}
+
+fn format_file_time(c_seconds: Option<u64>) -> String {
+    let Some(z_seconds) = c_seconds.filter(|c| *c <= 253_402_300_799) else {
+        return "—".into();
+    };
+    let (z_year, z_month, z_day, z_hour, z_minute, _) = utc_datetime(z_seconds);
+    format!("{z_year:04}-{z_month:02}-{z_day:02} {z_hour:02}:{z_minute:02}")
+}
+
+// 将 Unix 秒换算为本机本地时间 (年, 月, 日, 时, 分, 秒); 系统调用失败或超界时回退 UTC.
+fn local_datetime(c_seconds: u64) -> (i32, u32, u32, u32, u32, u32) {
+    let z_seconds = c_seconds.min(253_402_300_799);
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    {
+        use std::ffi::{c_char, c_int, c_long};
+        #[repr(C)]
+        struct Tm {
+            tm_sec: c_int,
+            tm_min: c_int,
+            tm_hour: c_int,
+            tm_mday: c_int,
+            tm_mon: c_int,
+            tm_year: c_int,
+            tm_wday: c_int,
+            tm_yday: c_int,
+            tm_isdst: c_int,
+            tm_gmtoff: c_long,
+            tm_zone: *const c_char,
+        }
+        unsafe extern "C" {
+            fn localtime_r(c_time: *const c_long, c_out: *mut Tm) -> *mut Tm;
+        }
+        if let Ok(l_time) = c_long::try_from(z_seconds) {
+            let mut l_tm = Tm {
+                tm_sec: 0, tm_min: 0, tm_hour: 0, tm_mday: 0, tm_mon: 0, tm_year: 0,
+                tm_wday: 0, tm_yday: 0, tm_isdst: 0, tm_gmtoff: 0, tm_zone: std::ptr::null(),
+            };
+            if !unsafe { localtime_r(&raw const l_time, &raw mut l_tm) }.is_null() {
+                return (
+                    l_tm.tm_year + 1900,
+                    (l_tm.tm_mon + 1) as u32,
+                    l_tm.tm_mday as u32,
+                    l_tm.tm_hour as u32,
+                    l_tm.tm_min as u32,
+                    l_tm.tm_sec.clamp(0, 59) as u32,
+                );
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        struct SystemTime {
+            year: u16,
+            month: u16,
+            day_of_week: u16,
+            day: u16,
+            hour: u16,
+            minute: u16,
+            second: u16,
+            milliseconds: u16,
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn SystemTimeToTzSpecificLocalTime(
+                c_tz: *const std::ffi::c_void,
+                c_utc: *const SystemTime,
+                c_local: *mut SystemTime,
+            ) -> i32;
+        }
+        let (l_year, l_month, l_day, l_hour, l_minute, l_second) = utc_datetime(z_seconds);
+        if let Ok(l_year) = u16::try_from(l_year) {
+            let l_utc = SystemTime {
+                year: l_year, month: l_month as u16, day_of_week: 0, day: l_day as u16,
+                hour: l_hour as u16, minute: l_minute as u16, second: l_second as u16, milliseconds: 0,
+            };
+            let mut l_local = SystemTime {
+                year: 0, month: 0, day_of_week: 0, day: 0, hour: 0, minute: 0, second: 0, milliseconds: 0,
+            };
+            if unsafe { SystemTimeToTzSpecificLocalTime(std::ptr::null(), &raw const l_utc, &raw mut l_local) } != 0 {
+                return (
+                    i32::from(l_local.year),
+                    u32::from(l_local.month),
+                    u32::from(l_local.day),
+                    u32::from(l_local.hour),
+                    u32::from(l_local.minute),
+                    u32::from(l_local.second),
+                );
+            }
+        }
+    }
+    utc_datetime(z_seconds)
+}
+
+fn local_today() -> (i32, u32, u32) {
+    let z_seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |c| c.as_secs());
+    let (z_year, z_month, z_day, _, _, _) = local_datetime(z_seconds);
+    (z_year, z_month, z_day)
+}
+
+// 已结束任务列表时间: 当天显示 HH:MM, 跨日显示 MM-DD HH:MM.
+fn format_task_time(c_ms: u64, c_today: (i32, u32, u32)) -> String {
+    if c_ms == 0 {
+        return String::new();
+    }
+    let (z_year, z_month, z_day, z_hour, z_minute, _) = local_datetime(c_ms / 1000);
+    if (z_year, z_month, z_day) == c_today {
+        format!("{z_hour:02}:{z_minute:02}")
+    } else {
+        format!("{z_month:02}-{z_day:02} {z_hour:02}:{z_minute:02}")
+    }
+}
+
+// 任务详情中的完整本地时间 (精确到秒).
+fn format_local_timestamp(c_ms: u64) -> String {
+    let (z_year, z_month, z_day, z_hour, z_minute, z_second) = local_datetime(c_ms / 1000);
+    format!("{z_year:04}-{z_month:02}-{z_day:02} {z_hour:02}:{z_minute:02}:{z_second:02}")
 }
 
 // 标签状态: 0 未连接, 1 连接中, 2 已连接, 3 仅文件 (终端未打开), 4 失败; 状态点与各处提示共用.
@@ -3454,20 +4157,19 @@ fn session_state(c_session: &Value) -> i32 {
     }
 }
 
-// 服务器显示名: "[分组] 名称", 未分组归入默认; 标签、状态栏、侧栏、快速连接和任务统一使用.
 // 编辑连接的代理下拉: 直连 + 当前代理列表, 位置与 ID 一一对应. 代理列表在编辑期间变化时按 ID 重新定位;
 // 所选代理已不存在 (如从别的电脑导入) 时保留一项提示, 不默认改成直连.
 fn refresh_edit_proxy_choices(c_ui: &AppWindow) {
     let z_selected = c_ui.get_edit_proxy_id();
     let mut z_ids = vec![SharedString::default()];
-    let mut z_names = vec![SharedString::from("直连")];
+    let mut z_names = vec![SharedString::from(t("直连", "Direct"))];
     for l_proxy in c_ui.get_proxies().iter() {
         z_ids.push(l_proxy.id);
         z_names.push(l_proxy.name);
     }
     if !z_selected.is_empty() && !z_ids.contains(&z_selected) {
         z_ids.push(z_selected.clone());
-        z_names.push("原代理已不存在, 请重新选择".into());
+        z_names.push(t("原代理已不存在, 请重新选择", "Proxy deleted; select another").into());
     }
     let z_index = z_ids.iter().position(|c| *c == z_selected).unwrap_or(0) as i32;
     c_ui.set_edit_proxy_ids(update_rows(c_ui.get_edit_proxy_ids(), z_ids));
@@ -3481,30 +4183,30 @@ fn server_label(c_item: &Value) -> String {
         return string(c_item, "name").to_owned();
     }
     let z_group = string(c_item, "group");
-    format!("[{}] {}", if z_group.is_empty() { "默认" } else { z_group }, string(c_item, "name"))
+    format!("[{}] {}", i18n::display_group(z_group), string(c_item, "name"))
 }
 
 fn status_label(c_status: &str) -> &str {
     match c_status {
-        "connected" => "已连接",
-        "empty" => "快速连接",
-        "connecting" => "连接中",
-        "host_key_confirmation" => "确认指纹",
-        "auth_required" => "等待认证",
-        "authenticating" => "认证中",
-        "authentication_failed" => "认证失败",
-        "disconnected" => "已断开",
-        "queued" => "排队中",
-        "preparing" => "准备中",
-        "running" => "进行中",
-        "retrying" => "等待恢复",
-        "cancelling" => "正在取消",
-        "completed" => "已完成",
-        "cancelled" => "已取消",
-        "failed" => "失败",
+        "connected" => t("已连接", "Connected"),
+        "empty" => t("快速连接", "Quick Connect"),
+        "connecting" => t("连接中", "Connecting"),
+        "host_key_confirmation" => t("确认指纹", "Verify Key"),
+        "auth_required" => t("等待认证", "Auth Required"),
+        "authenticating" => t("认证中", "Authenticating"),
+        "authentication_failed" => t("认证失败", "Auth Failed"),
+        "disconnected" => t("已断开", "Disconnected"),
+        "queued" => t("排队中", "Queued"),
+        "preparing" => t("准备中", "Preparing"),
+        "running" => t("进行中", "Running"),
+        "retrying" => t("等待恢复", "Retrying"),
+        "cancelling" => t("正在取消", "Cancelling"),
+        "completed" => t("已完成", "Completed"),
+        "cancelled" => t("已取消", "Cancelled"),
+        "failed" => t("失败", "Failed"),
         // 具体原因由状态栏左侧消息和终端区提示显示, 标签与会话状态只给简短状态.
-        _ if c_status.starts_with("error: 连接已断开:") => "已断开",
-        _ if c_status.starts_with("error") => "连接失败",
+        _ if c_status.starts_with("error: 连接已断开:") => t("已断开", "Disconnected"),
+        _ if c_status.starts_with("error") => t("连接失败", "Failed"),
         _ => c_status,
     }
 }
@@ -3512,10 +4214,11 @@ fn status_label(c_status: &str) -> &str {
 // 会话失败原因: error: 前缀为具体错误, authentication_failed 为服务器拒绝了凭据; 其他状态为空.
 fn session_error(c_status: &str) -> String {
     match c_status {
-        "authentication_failed" => "服务器拒绝了密码或私钥, 请检查凭据".into(),
+        "authentication_failed" => t("服务器拒绝了密码或私钥, 请检查凭据", "Server rejected password or key; check credentials").into(),
         _ => {
             let l_msg = c_status.strip_prefix("error: ").unwrap_or_default();
-            l_msg.strip_prefix("连接已断开: ").unwrap_or(l_msg).into()
+            let l_raw = l_msg.strip_prefix("连接已断开: ").unwrap_or(l_msg);
+            if l_raw.is_empty() { String::new() } else { friendly_error(l_raw) }
         }
     }
 }
@@ -3559,7 +4262,7 @@ fn apply_monitor_usage(c_ui: &AppWindow, c_session: Option<&Value>) {
         if z_total == 0.0 {
             "—".into()
         } else if z_swap_total == 0.0 {
-            "未启用".into()
+            t("未启用", "Disabled").into()
         } else {
             format!(
                 "{:.0}% · {} / {}",
@@ -3642,13 +4345,13 @@ fn apply_transfer_summary(c_ui: &AppWindow, c_tasks: &[Value], c_connections: &H
     c_ui.set_transfer_down_progress(z_progress(z_down_bytes, z_down_total));
     c_ui.set_transfer_up_speed(z_speed(z_up_speed));
     c_ui.set_transfer_down_speed(z_speed(z_down_speed));
-    if z_new_user {
+    if z_new_user && !c_ui.get_modal_open() {
         c_ui.set_transfers_open(true);
     }
 }
 
 fn task_active(c_status: &str) -> bool {
-    matches!(c_status, "queued" | "preparing" | "running" | "retrying")
+    matches!(c_status, "queued" | "preparing" | "running" | "retrying" | "cancelling")
 }
 
 // 默认下载目录: 用户目录下的桌面, 没有桌面时用用户目录. Windows 开启 OneDrive 备份后桌面在 %OneDrive%\Desktop,
@@ -3663,10 +4366,18 @@ fn desktop_dir() -> String {
 // 剩余时间: 1 分钟内按秒, 1 小时内按分秒, 更长按时分.
 fn format_eta(c_seconds: f64) -> String {
     let z_seconds = c_seconds.ceil().min(359_999.0) as u64;
-    match z_seconds {
-        0..60 => format!("{z_seconds}秒"),
-        60..3600 => format!("{}分{}秒", z_seconds / 60, z_seconds % 60),
-        _ => format!("{}小时{}分", z_seconds / 3600, z_seconds % 3600 / 60),
+    if is_en() {
+        match z_seconds {
+            0..60 => format!("{z_seconds}s"),
+            60..3600 => format!("{}m {}s", z_seconds / 60, z_seconds % 60),
+            _ => format!("{}h {}m", z_seconds / 3600, z_seconds % 3600 / 60),
+        }
+    } else {
+        match z_seconds {
+            0..60 => format!("{z_seconds}秒"),
+            60..3600 => format!("{}分{}秒", z_seconds / 60, z_seconds % 60),
+            _ => format!("{}小时{}分", z_seconds / 3600, z_seconds % 3600 / 60),
+        }
     }
 }
 
@@ -3674,12 +4385,20 @@ fn format_eta(c_seconds: f64) -> String {
 fn reveal_local(c_ui: &AppWindow, c_path: &str, c_select: bool) {
     let z_path = std::path::Path::new(c_path);
     if c_path.is_empty() || !z_path.is_absolute() {
-        return notify(c_ui, NOTE_WARN, "没有可打开的本机路径");
+        return notify(c_ui, NOTE_WARN, t("没有可打开的本机路径", "No local path available"));
     }
     let z_select = c_select && z_path.exists();
     let z_target = if c_select && !z_select { z_path.parent().unwrap_or(z_path) } else { z_path };
     if !z_target.exists() {
-        return notify(c_ui, NOTE_WARN, format!("本机路径已不存在: {}", z_target.display()));
+        return notify(
+            c_ui,
+            NOTE_WARN,
+            if is_en() {
+                format!("Local path not found: {}", z_target.display())
+            } else {
+                format!("本机路径已不存在: {}", z_target.display())
+            },
+        );
     }
     #[cfg(target_os = "macos")]
     let z_result = {
@@ -3698,7 +4417,15 @@ fn reveal_local(c_ui: &AppWindow, c_path: &str, c_select: bool) {
     #[cfg(not(any(target_os = "macos", windows)))]
     let z_result = std::process::Command::new("xdg-open").arg(if z_select { z_target.parent().unwrap_or(z_target) } else { z_target }).spawn();
     if let Err(err) = z_result {
-        notify(c_ui, NOTE_ERROR, format!("打开文件管理器失败: {err}"));
+        notify(
+            c_ui,
+            NOTE_ERROR,
+            if is_en() {
+                format!("Failed to open file manager: {err}")
+            } else {
+                format!("打开文件管理器失败: {err}")
+            },
+        );
     }
 }
 
@@ -3900,7 +4627,7 @@ fn apply_monitor_history(c_ui: &AppWindow, c_session: Option<&Value>) {
     let z_index = z_interfaces
         .iter()
         .position(|c| string(c, "name") == z_selected.as_str());
-    let mut z_names = vec![SharedString::from("全部网卡")];
+    let mut z_names = vec![SharedString::from(t("全部网卡", "All Interfaces"))];
     z_names.extend(z_interfaces.iter().map(|c| string(c, "name").into()));
     // 复用原模型逐行比较, 数据未变时不标脏, 避免软件渲染整窗重画.
     c_ui.set_network_interfaces(update_rows(c_ui.get_network_interfaces(), z_names));
@@ -3940,7 +4667,18 @@ fn apply_monitor_history(c_ui: &AppWindow, c_session: Option<&Value>) {
     c_ui.set_network_rx_area(z_rx_area.into());
     c_ui.set_network_tx_line(z_tx_line.into());
     c_ui.set_network_tx_area(z_tx_area.into());
-    c_ui.set_network_peak(if z_sampled { format!("峰值 {}/s", format_bytes(z_peak)) } else { String::new() }.into());
+    c_ui.set_network_peak(
+        if z_sampled {
+            if is_en() {
+                format!("Peak {}/s", format_bytes(z_peak))
+            } else {
+                format!("峰值 {}/s", format_bytes(z_peak))
+            }
+        } else {
+            String::new()
+        }
+        .into(),
+    );
 }
 
 // 采样两两合并为 60 个点; 时间轴固定占满图框, 新采样从右侧进入, 未采样部分保持基线.
@@ -3996,10 +4734,10 @@ fn apply_monitor_processes(c_ui: &AppWindow, c_session: Option<&Value>) {
 
 fn monitor_text(c_session: &Value) -> String {
     let Some(z_monitor) = c_session.get("monitor").filter(|c_item| c_item.is_object()) else {
-        return "等待监控数据".into();
+        return t("等待监控数据", "Waiting for monitor data").into();
     };
     if !string(z_monitor, "error").is_empty() {
-        return format!("监控暂不可用\n{}", string(z_monitor, "error"));
+        return format!("{}\n{}", t("监控暂不可用", "Monitor unavailable"), friendly_error(string(z_monitor, "error")));
     }
     String::new()
 }
@@ -4011,55 +4749,88 @@ fn task_output(c_ui: &AppWindow, c_task: &Value) -> String {
     let z_kind = string(c_task, "kind");
     let z_code = c_task.get("exit_code").and_then(Value::as_i64);
     let z_status = match string(c_task, "status") {
-        "completed" if z_code.is_some_and(|c| c != 0) => "执行失败",
-        "completed" if z_kind == "command" => "执行成功",
+        "completed" if z_code.is_some_and(|c| c != 0) => t("执行失败", "Failed"),
+        "completed" if z_kind == "command" => t("执行成功", "Succeeded"),
         l_status => status_label(l_status),
     };
     let mut z_output = String::new();
     match z_kind {
         "upload" => {
-            let _ = writeln!(z_output, "上传  {}", string(c_task, "local"));
-            let _ = writeln!(z_output, "到    {}", string(c_task, "label"));
+            let _ = writeln!(z_output, "{}  {}", t("上传", "Upload"), string(c_task, "local"));
+            let _ = writeln!(z_output, "{}  {}", t("到  ", "To    "), string(c_task, "label"));
         }
         "download" => {
-            let _ = writeln!(z_output, "下载  {}", string(c_task, "label"));
-            let _ = writeln!(z_output, "到    {}", string(c_task, "local"));
+            let _ = writeln!(z_output, "{}  {}", t("下载", "Download"), string(c_task, "label"));
+            let _ = writeln!(z_output, "{}  {}", t("到  ", "To      "), string(c_task, "local"));
         }
         _ => {
-            let _ = writeln!(z_output, "命令  {}", string(c_task, "label").replace('\n', "\n      "));
+            let _ = writeln!(z_output, "{}  {}", t("命令", "Command"), string(c_task, "label").replace('\n', "\n         "));
         }
     }
     if let Some(z_row) = &z_row {
-        let _ = writeln!(z_output, "服务器  {}  ·  来源 {}", z_row.server, z_row.source);
+        let _ = writeln!(
+            z_output,
+            "{}  {}  ·  {} {}",
+            t("服务器", "Host"),
+            z_row.server,
+            t("来源", "Source"),
+            z_row.source
+        );
     }
-    let _ = write!(z_output, "状态  {z_status}");
+    let _ = write!(z_output, "{}  {z_status}", t("状态", "Status"));
     if let Some(z_code) = z_code {
-        let _ = write!(z_output, "  ·  退出码 {z_code}");
+        let _ = write!(z_output, "  ·  {} {z_code}", t("退出码", "Exit"));
     }
     if let Some(z_timing) = task_timing(c_task) {
         let _ = write!(z_output, "  ·  {z_timing}");
     }
     z_output.push('\n');
+    if let Some(z_at) = ["finished_at_ms", "started_at_ms", "created_at_ms"]
+        .into_iter()
+        .find_map(|c_key| c_task.get(c_key).and_then(Value::as_u64).filter(|c| *c > 0))
+    {
+        let _ = writeln!(z_output, "{}  {}", t("时间", "Time"), format_local_timestamp(z_at));
+    }
     if z_kind != "command" {
         let l_total = number(c_task, "total");
         let _ = writeln!(
             z_output,
-            "大小  {}{}",
+            "{}  {}{}",
+            t("大小", "Size"),
             format_bytes(number(c_task, "bytes")),
             if l_total > 0.0 { format!(" / {}", format_bytes(l_total)) } else { String::new() }
         );
         if boolean(c_task, "directory") {
-            let _ = writeln!(z_output, "文件  {:.0} / {:.0}", number(c_task, "files_done"), number(c_task, "files_total"));
+            let l_failed = number(c_task, "files_failed");
+            let _ = writeln!(
+                z_output,
+                "{}  {:.0} / {:.0}{}",
+                t("文件", "Files"),
+                number(c_task, "files_done"),
+                number(c_task, "files_total"),
+                if l_failed > 0.0 {
+                    if is_en() { format!("  ({l_failed:.0} failed)") } else { format!("  (失败 {l_failed:.0})") }
+                } else {
+                    String::new()
+                },
+            );
             if string(c_task, "status") == "running" {
-                let _ = writeln!(z_output, "当前  {}", string(c_task, "current"));
+                let _ = writeln!(z_output, "{}  {}", t("当前", "Current"), string(c_task, "current"));
             }
         }
         let l_retries = number(c_task, "transfer_retries");
         if l_retries > 0.0 {
-            let _ = writeln!(z_output, "自动重试  {l_retries:.0} 次");
+            if is_en() {
+                let _ = writeln!(z_output, "Retries  {l_retries:.0}");
+            } else {
+                let _ = writeln!(z_output, "自动重试  {l_retries:.0} 次");
+            }
         }
         if string(c_task, "status") == "retrying" {
-            z_output.push_str("正在自动重连, 恢复后从已保留进度继续; 可取消任务.\n");
+            z_output.push_str(t(
+                "正在自动重连, 恢复后从已保留进度继续; 可取消任务.\n",
+                "Reconnecting automatically; will resume from saved progress. You may cancel.\n",
+            ));
         }
     }
     let mut z_section = |c_title: &str, c_text: &str| {
@@ -4068,17 +4839,39 @@ fn task_output(c_ui: &AppWindow, c_task: &Value) -> String {
             z_output.push('\n');
         }
     };
-    z_section("输出", string(c_task, "stdout"));
-    z_section(if z_code == Some(0) { "提示输出" } else { "错误输出" }, string(c_task, "stderr"));
+    let z_stdout = if z_kind == "command" {
+        i18n::localize_command_output(string(c_task, "stdout")).to_owned()
+    } else {
+        i18n::localize_transfer_output(string(c_task, "stdout"))
+    };
+    z_section(t("输出", "Output"), &z_stdout);
+    let z_stderr = if z_kind == "command" {
+        string(c_task, "stderr").to_owned()
+    } else {
+        i18n::localize_transfer_output(string(c_task, "stderr"))
+    };
+    z_section(
+        if z_code == Some(0) || (z_kind != "command" && string(c_task, "status") == "completed") {
+            t("提示输出", "Notice")
+        } else {
+            t("错误输出", "Stderr")
+        },
+        &z_stderr,
+    );
     if string(c_task, "last_transfer_error") != string(c_task, "error") {
-        z_section("最近一次重试原因", string(c_task, "last_transfer_error"));
+        let l_retry_err = friendly_error(string(c_task, "last_transfer_error"));
+        z_section(t("最近一次重试原因", "Last Retry Error"), &l_retry_err);
     }
-    z_section(if string(c_task, "status") == "retrying" { "恢复原因" } else { "错误" }, string(c_task, "error"));
+    let z_err = friendly_error(string(c_task, "error"));
+    z_section(
+        if string(c_task, "status") == "retrying" { t("恢复原因", "Recovery Reason") } else { t("错误", "Error") },
+        &z_err,
+    );
     if z_kind == "command" && matches!(string(c_task, "status"), "completed") && string(c_task, "stdout").is_empty() && string(c_task, "stderr").is_empty() {
-        z_output.push_str("\n(无输出)\n");
+        z_output.push_str(t("\n(无输出)\n", "\n(no output)\n"));
     }
     if boolean(c_task, "truncated") {
-        z_output.push_str("\n输出已达显示上限.\n");
+        z_output.push_str(t("\n输出已达显示上限.\n", "\nOutput truncated.\n"));
     }
     z_output
 }
@@ -4088,13 +4881,20 @@ fn task_timing(c_task: &Value) -> Option<String> {
     let z_end = c_task.get("finished_at_ms").and_then(Value::as_u64)?;
     let z_ms = z_end.saturating_sub(z_start);
     let z_seconds = z_ms / 1000;
-    let mut z_text = if z_seconds >= 60 {
+    let mut z_text = if is_en() {
+        if z_seconds >= 60 {
+            format!("{}m {}s", z_seconds / 60, z_seconds % 60)
+        } else {
+            format!("{:.1}s", z_ms as f64 / 1000.0)
+        }
+    } else if z_seconds >= 60 {
         format!("用时 {}分{}秒", z_seconds / 60, z_seconds % 60)
     } else {
         format!("用时 {:.1} 秒", z_ms as f64 / 1000.0)
     };
     if string(c_task, "kind") != "command" && string(c_task, "status") == "completed" && z_ms > 0 {
-        let _ = std::fmt::Write::write_fmt(&mut z_text, format_args!(" · 平均 {}/s", format_bytes(number(c_task, "bytes") * 1000.0 / z_ms as f64)));
+        let l_avg = format_bytes(number(c_task, "bytes") * 1000.0 / z_ms as f64);
+        let _ = std::fmt::Write::write_fmt(&mut z_text, format_args!(" · {} {l_avg}/s", t("平均", "avg")));
     }
     Some(z_text)
 }
@@ -4139,83 +4939,82 @@ fn parse_color(c_text: &str, c_default: slint::Color) -> slint::Color {
 // MCP 侧栏的动作名与风险等级 (0 只读, 1 连接, 2 文件传输, 3 执行命令); 动作名说明在哪执行, 不展开具体命令.
 fn mcp_action(c_method: &str) -> (&str, i32) {
     match c_method {
-        "state" => ("查看状态", 0),
-        "read_terminal" => ("读取主终端", 0),
-        "list_files" => ("浏览远端目录", 0),
-        "list_local_files" => ("浏览本机目录", 0),
-        "get_task" => ("查询任务", 0),
-        "cancel_task" => ("取消任务", 0),
-        "connect" => ("连接", 1),
-        "disconnect" => ("断开", 1),
-        "reconnect" => ("重新连接", 1),
-        "open_terminal" => ("打开终端", 1),
-        "upload_file" => ("上传文件", 2),
-        "download_file" => ("下载文件", 2),
-        "upload_directory" => ("上传文件夹", 2),
-        "download_directory" => ("下载文件夹", 2),
-        "write_terminal" => ("输入主终端", 3),
-        "input_admin_password" => ("输入管理员密码", 3),
-        "run_command" => ("独立执行命令", 3),
+        "state" => (t("查看状态", "Read State"), 0),
+        "read_terminal" => (t("读取主终端", "Read Terminal"), 0),
+        "list_files" => (t("浏览远端目录", "List Remote"), 0),
+        "list_local_files" => (t("浏览本机目录", "List Local"), 0),
+        "get_task" => (t("查询任务", "Check Task"), 0),
+        "cancel_task" => (t("取消任务", "Cancel Task"), 0),
+        "connect" => (t("连接", "Connect"), 1),
+        "disconnect" => (t("断开", "Disconnect"), 1),
+        "reconnect" => (t("重新连接", "Reconnect"), 1),
+        "open_terminal" => (t("打开终端", "Open Terminal"), 1),
+        "upload_file" => (t("上传文件", "Upload File"), 2),
+        "download_file" => (t("下载文件", "Download File"), 2),
+        "upload_directory" => (t("上传文件夹", "Upload Folder"), 2),
+        "download_directory" => (t("下载文件夹", "Download Folder"), 2),
+        "write_terminal" => (t("输入主终端", "Write Terminal"), 3),
+        "input_admin_password" => (t("输入管理员密码", "Send sudo Password"), 3),
+        "run_command" => (t("独立执行命令", "Run Detached"), 3),
         c_other => (method_label(c_other), 0),
     }
 }
 fn method_label(c_method: &str) -> &str {
     match c_method {
-        "state" => "读取状态",
-        "read_terminal" => "读取终端",
-        "write_terminal" => "输入终端",
-        "input_admin_password" => "输入管理员密码",
-        "get_task" => "查询任务",
-        "connect" => "连接",
-        "open_terminal" => "重新连接终端",
-        "close_terminal" => "关闭终端",
-        "save_connection" => "保存连接",
-        "save_saved_command" => "保存常用命令",
-        "delete_saved_command" => "删除常用命令",
-        "save_command_group" => "保存命令分组",
-        "delete_command_group" => "删除命令分组",
-        "save_connection_group" => "保存连接分组",
-        "delete_connection_group" => "删除连接分组",
-        "save_proxy" => "保存代理",
-        "delete_proxy" => "删除代理",
-        "set_connection_proxy" => "设置代理",
-        "send_saved_command" => "发送常用命令",
-        "send_command" => "发送命令",
-        "list_local_files" => "浏览本地目录",
-        "remove_connection" => "删除连接",
-        "import_finalshell" => "导入",
-        "export_finalshell" => "导出",
-        "import_commands" => "导入命令",
-        "export_commands" => "导出命令",
-        "list_files" => "目录浏览",
-        "set_permissions" => "修改权限",
-        "rename_file" => "重命名",
-        "create_directory" => "新建文件夹",
-        "create_file" => "新建文件",
-        "focus_session" => "切换标签",
-        "set_terminal_font" => "保存终端字体",
-        "set_terminal_scrollback" => "保存历史行数",
-        "set_transfer_limits" => "保存传输设置",
-        "set_tab_show_group" => "保存标签分组显示",
-        "set_download_dir" => "设置下载目录",
-        "set_connection_columns" => "保存列宽",
-        "delete_files" => "删除",
-        "delete_files_fast" => "快速删除",
-        "copy_file" => "创建副本",
-        "upload_file" => "上传任务创建",
-        "download_file" => "下载任务创建",
-        "upload_directory" | "download_directory" => "文件夹传输任务创建",
-        "run_command" => "命令任务创建",
-        "trust_host" => "主机信任处理",
-        "answer_auth" => "认证回答提交",
-        "cancel_task" => "任务取消",
-        "disconnect" => "断开",
-        "new_tab" => "新建标签",
-        "clear_recent_connections" => "删除快速连接记录",
-        "move_tab" => "移动标签",
-        "set_expanded_groups" => "保存分组展开状态",
-        "reconnect" => "重新连接",
-        _ => "操作",
+        "state" => t("读取状态", "Read state"),
+        "read_terminal" => t("读取终端", "Read terminal"),
+        "write_terminal" => t("输入终端", "Terminal input"),
+        "input_admin_password" => t("输入管理员密码", "Send sudo password"),
+        "get_task" => t("查询任务", "Check task"),
+        "connect" => t("连接", "Connect"),
+        "open_terminal" => t("重新连接终端", "Open terminal"),
+        "close_terminal" => t("关闭终端", "Close terminal"),
+        "save_connection" => t("保存连接", "Save host"),
+        "save_saved_command" => t("保存常用命令", "Save command"),
+        "delete_saved_command" => t("删除常用命令", "Delete command"),
+        "save_command_group" => t("保存命令分组", "Save command group"),
+        "delete_command_group" => t("删除命令分组", "Delete command group"),
+        "save_connection_group" => t("保存连接分组", "Save host group"),
+        "delete_connection_group" => t("删除连接分组", "Delete host group"),
+        "save_proxy" => t("保存代理", "Save proxy"),
+        "delete_proxy" => t("删除代理", "Delete proxy"),
+        "set_connection_proxy" => t("设置代理", "Set proxy"),
+        "send_saved_command" => t("发送常用命令", "Send command"),
+        "send_command" => t("发送命令", "Send command"),
+        "list_local_files" => t("浏览本地目录", "List local"),
+        "remove_connection" => t("删除连接", "Delete host"),
+        "import_finalshell" => t("导入", "Import"),
+        "export_finalshell" => t("导出", "Export"),
+        "import_commands" => t("导入命令", "Import commands"),
+        "export_commands" => t("导出命令", "Export commands"),
+        "list_files" => t("目录浏览", "List files"),
+        "set_permissions" => t("修改权限", "Set permissions"),
+        "rename_file" => t("重命名", "Rename"),
+        "create_directory" => t("新建文件夹", "New folder"),
+        "create_file" => t("新建文件", "New file"),
+        "focus_session" => t("切换标签", "Switch tab"),
+        "set_terminal_font" => t("保存终端字体", "Save terminal font"),
+        "set_terminal_scrollback" => t("保存历史行数", "Save scrollback"),
+        "set_tab_show_group" => t("保存标签分组显示", "Save group display"),
+        "set_download_dir" => t("设置下载目录", "Set download folder"),
+        "set_connection_columns" => t("保存列宽", "Save column widths"),
+        "delete_files" => t("删除", "Delete"),
+        "delete_files_fast" => t("快速删除", "Force delete"),
+        "copy_file" => t("创建副本", "Duplicate"),
+        "upload_file" => t("上传任务创建", "Queue upload"),
+        "download_file" => t("下载任务创建", "Queue download"),
+        "upload_directory" | "download_directory" => t("文件夹传输任务创建", "Queue folder transfer"),
+        "run_command" => t("命令任务创建", "Queue command"),
+        "trust_host" => t("主机信任处理", "Trust host"),
+        "answer_auth" => t("认证回答提交", "Submit auth"),
+        "cancel_task" => t("任务取消", "Cancel task"),
+        "disconnect" => t("断开", "Disconnect"),
+        "new_tab" => t("新建标签", "New tab"),
+        "clear_recent_connections" => t("删除快速连接记录", "Clear recent hosts"),
+        "move_tab" => t("移动标签", "Move tab"),
+        "set_expanded_groups" => t("保存分组展开状态", "Save expanded groups"),
+        "reconnect" => t("重新连接", "Reconnect"),
+        _ => t("操作", "Action"),
     }
 }
 // 状态栏消息类别, 与界面 status-kind 一致.
@@ -4235,10 +5034,11 @@ fn notify_retry(c_ui: &AppWindow, c_text: String, c_action: &str, c_arg: SharedS
 enum ConflictChoice { Overwrite, KeepBoth, Skip }
 
 // 原生确认框最多三个按钮, 使用现有界面对话框同时保留四种选择; 多个批次的询问依次显示.
-async fn ask_conflict(c_weak: slint::Weak<AppWindow>, c_names: &[String]) -> Option<ConflictChoice> {
+async fn ask_conflict(c_weak: slint::Weak<AppWindow>, c_target: String, c_names: &[String]) -> Option<ConflictChoice> {
     let z_names = c_names.join("\n");
     match ask_in_ui(c_weak, move |c_ui| {
         c_ui.set_conflict_kind(0);
+        c_ui.set_conflict_target(c_target.into());
         c_ui.set_conflict_names(z_names.into());
     }).await? {
         1 => Some(ConflictChoice::Overwrite),
@@ -4248,10 +5048,11 @@ async fn ask_conflict(c_weak: slint::Weak<AppWindow>, c_names: &[String]) -> Opt
     }
 }
 // 下载多项到默认目录前确认目录 (界面内对话框, 与同名询问同一风格), 确认返回 true.
-async fn confirm_download(c_weak: slint::Weak<AppWindow>, c_count: usize) -> bool {
+async fn confirm_download(c_weak: slint::Weak<AppWindow>, c_count: usize, c_dir: String) -> bool {
     ask_in_ui(c_weak, move |c_ui| {
         c_ui.set_conflict_kind(1);
         c_ui.set_conflict_count(c_count as i32);
+        c_ui.set_conflict_target(c_dir.into());
     }).await == Some(1)
 }
 // 界面内询问框共用一个应答通道: 全局串行, 多个批次的询问依次显示, 不会互相覆盖应答.
@@ -4286,63 +5087,127 @@ fn alert_transfer_failures(c_runtime: &tokio::runtime::Handle, c_items: Vec<Stri
                 }
                 std::mem::take(&mut l_pending.1)
             };
-            let l_more = if l_items.len() > 5 { format!("\n\n… 另有 {} 个失败, 详见任务列表", l_items.len() - 5) } else { String::new() };
+            let l_more = if l_items.len() > 5 {
+                if is_en() {
+                    format!("\n\n… and {} more; see Tasks", l_items.len() - 5)
+                } else {
+                    format!("\n\n… 另有 {} 个失败, 详见任务列表", l_items.len() - 5)
+                }
+            } else {
+                String::new()
+            };
+            let l_footer = t(
+                "目标文件保持原样, 未完成的临时文件已清理 (网络中断的任务已先自动重连续传). 请查看原因后重新传输.",
+                "Destination files were left intact and temporary files were cleaned up (interrupted transfers were retried automatically). Check the reason and retry.",
+            );
             rfd::AsyncMessageDialog::new()
-                .set_title("传输失败")
+                .set_title(t("传输失败", "Transfer Failed"))
                 .set_level(rfd::MessageLevel::Error)
-                .set_description(format!("{}{l_more}\n\n目标文件保持原样, 未完成的临时文件已清理 (网络中断的任务已先自动重连续传). 请查看原因后重新传输.", l_items[..l_items.len().min(5)].join("\n\n")))
+                .set_description(format!("{}{l_more}\n\n{l_footer}", l_items[..l_items.len().min(5)].join("\n\n")))
                 .set_buttons(rfd::MessageButtons::Ok)
                 .show()
                 .await;
         }
     });
 }
-// "名称 (1).扩展名" 形式的未占用名称.
-fn unique_name(c_name: &str, c_taken: impl Fn(&str) -> bool) -> String {
+// "名称 (1).扩展名" 或文件夹 "名称 (1)" 形式的未占用名称.
+fn unique_name(c_name: &str, c_directory: bool, c_taken: impl Fn(&str) -> bool) -> String {
     let (z_stem, z_ext) = match c_name.rfind('.') {
-        Some(i) if i > 0 => (&c_name[..i], &c_name[i..]),
+        Some(i) if !c_directory && i > 0 => (&c_name[..i], &c_name[i..]),
         _ => (c_name, ""),
     };
     (1..1000).map(|i| format!("{z_stem} ({i}){z_ext}")).find(|c| !c_taken(c)).unwrap_or_else(|| c_name.to_owned())
 }
-// 常见的服务器英文错误 (SFTP 状态、rm/mkdir 等命令输出) 换成中文, 其余原样保留; 只用于界面提示, MCP 仍返回原文.
-// SFTP 状态错误会显示为"原因: 原因", 替换后合并为一处.
-fn friendly_error(c_error: &str) -> String {
-    const TEXTS: [(&str, &str); 18] = [
-        ("Permission denied", "权限不足"),
-        ("Operation not permitted", "操作不被允许"),
-        ("No such file or directory", "文件或目录不存在"),
-        ("No such file", "文件或目录不存在"),
-        ("Directory not empty", "目录不为空"),
-        ("File exists", "文件已存在"),
-        ("Not a directory", "不是目录"),
-        ("Is a directory", "是一个目录"),
-        ("Read-only file system", "只读文件系统"),
-        ("No space left on device", "磁盘空间不足"),
-        ("Disk quota exceeded", "超出磁盘配额"),
-        ("Device or resource busy", "设备或资源正忙"),
-        ("Text file busy", "文件正在被使用"),
-        ("File name too long", "文件名过长"),
-        ("Too many levels of symbolic links", "符号链接层级过多"),
-        ("Connection refused", "连接被拒绝"),
-        ("Connection reset by peer", "连接被对方重置"),
-        ("cannot remove", "无法删除"),
-    ];
-    let mut z_text = c_error.to_owned();
-    for (l_from, l_to) in TEXTS {
-        if z_text.contains(l_from) {
-            z_text = z_text.replace(l_from, l_to).replace(&format!("{l_to}: {l_to}"), l_to);
-        }
-    }
-    z_text
+// 原生确认对话框: 统一处理自定义主按钮与系统 Ok/Yes 回传.
+async fn confirm_dialog(
+    c_title: &'static str,
+    c_description: impl Into<String>,
+    c_level: rfd::MessageLevel,
+    c_ok: &'static str,
+) -> bool {
+    let z_answer = rfd::AsyncMessageDialog::new()
+        .set_title(c_title)
+        .set_level(c_level)
+        .set_description(c_description.into())
+        .set_buttons(rfd::MessageButtons::OkCancelCustom(c_ok.into(), t("取消", "Cancel").into()))
+        .show()
+        .await;
+    matches!(z_answer, rfd::MessageDialogResult::Ok | rfd::MessageDialogResult::Yes)
+        || matches!(&z_answer, rfd::MessageDialogResult::Custom(c) if c == c_ok)
+}
+
+fn is_fatal_batch_error(c_err: &anyhow::Error) -> bool {
+    let z_text = format!("{c_err:#}");
+    z_text.contains("会话已断开")
+        || z_text.contains("会话不存在")
+        || z_text.contains("标签已重新连接")
+        || z_text.contains("任务队列已满")
 }
 // 批量创建传输任务中途失败: 一个都没创建时不再显示"已加入 0 个".
-fn batch_error(c_kind: &str, c_count: usize, c_err: &anyhow::Error) -> String {
-    if c_count == 0 {
-        format!("{c_kind}任务创建失败: {c_err}")
+fn batch_error(c_upload: bool, c_count: usize, c_err: &anyhow::Error) -> String {
+    let z_err = friendly_error(&format!("{c_err}"));
+    if is_en() {
+        let l_kind = if c_upload { "upload" } else { "download" };
+        if c_count == 0 {
+            format!("Failed to queue {l_kind}: {z_err}")
+        } else {
+            format!("Queued {c_count} {l_kind}(s), remaining failed: {z_err}")
+        }
     } else {
-        format!("已加入 {c_count} 个{c_kind}任务, 后续任务创建失败: {c_err}")
+        let l_kind = if c_upload { "上传" } else { "下载" };
+        if c_count == 0 {
+            format!("{l_kind}任务创建失败: {z_err}")
+        } else {
+            format!("已加入 {c_count} 个{l_kind}任务, 后续任务创建失败: {z_err}")
+        }
     }
+}
+// 上传与下载共用批量排队汇总提示, 统一经过 friendly_error 处理错误文案.
+fn finish_transfer_batch(
+    c_weak: slint::Weak<AppWindow>,
+    c_upload: bool,
+    c_count: usize,
+    c_failed: usize,
+    c_skipped: usize,
+    c_first_err: Option<anyhow::Error>,
+) {
+    if let Some(err) = c_first_err {
+        let l_err = friendly_error(&format!("{err:#}"));
+        let l_msg = if is_en() {
+            let l_kind = if c_upload { "upload" } else { "download" };
+            let l_cap = if c_upload { "Upload" } else { "Download" };
+            let l_skip = if c_skipped > 0 { format!(", {c_skipped} skipped") } else { String::new() };
+            if c_count == 0 {
+                format!("{l_cap} failed to queue ({c_failed}{l_skip}): {l_err}")
+            } else {
+                format!("Queued {c_count} {l_kind}(s){l_skip}, {c_failed} failed: {l_err}")
+            }
+        } else {
+            let l_kind = if c_upload { "上传" } else { "下载" };
+            let l_skip = if c_skipped > 0 { format!(", 已跳过 {c_skipped} 项") } else { String::new() };
+            if c_count == 0 {
+                format!("{l_kind}任务创建失败 ({c_failed} 项{l_skip}): {l_err}")
+            } else {
+                format!("已加入 {c_count} 个{l_kind}任务{l_skip}, {c_failed} 项创建失败: {l_err}")
+            }
+        };
+        show_notice(c_weak, NOTE_ERROR, l_msg);
+        return;
+    }
+    let z_msg = if is_en() {
+        let l_kind = if c_upload { "upload" } else { "download" };
+        format!(
+            "Queued {c_count} {l_kind}(s){}",
+            if c_skipped > 0 { format!(", {c_skipped} skipped") } else { String::new() }
+        )
+    } else {
+        let l_kind = if c_upload { "上传" } else { "下载" };
+        format!(
+            "已加入 {c_count} 个{l_kind}任务{}",
+            if c_skipped > 0 { format!(", 已跳过 {c_skipped} 个同名文件") } else { String::new() }
+        )
+    };
+    show_notice(c_weak, NOTE_OK, z_msg);
 }
 // 单个标签的输入发送任务: 连续键入与粘贴合并为不超过 16 KiB 的块按序发送; 标签关闭后发送失败即结束.
 async fn terminal_input_worker(
@@ -4391,7 +5256,12 @@ async fn terminal_input_worker(
             }
             let z_result = c_backend.call("write_terminal", l_args, Actor::User).await;
             if let Err(err) = z_result {
-                show_notice(c_weak.clone(), NOTE_ERROR, format!("终端输入失败: {err}"));
+                let l_err = friendly_error(&format!("{err}"));
+                show_notice(
+                    c_weak.clone(),
+                    NOTE_ERROR,
+                    if is_en() { format!("Terminal input failed: {l_err}") } else { format!("终端输入失败: {l_err}") },
+                );
                 // 带终端代次的输入 (确认后的粘贴) 被拒多因终端已重开: 只丢弃这一段, 继续发送之后排队的按键;
                 // 若实为标签已关闭, 下一条输入同样失败后再结束.
                 if z_epoch.1 != 0 {
@@ -4407,38 +5277,65 @@ async fn terminal_input_worker(
         z_data.zeroize();
     }
 }
+fn build_mcp_prompt(c_url: &str, c_config: &str) -> String {
+    let z_pretty = serde_json::from_str::<Value>(c_config)
+        .ok()
+        .and_then(|c| serde_json::to_string_pretty(&c).ok())
+        .unwrap_or_else(|| c_config.to_owned());
+    if is_en() {
+        format!(
+            "Please register my local HiPShell as an MCP server (Streamable HTTP). One-time setup.\n\n\
+             - Name: hipshell\n- URL: {c_url}\n- No token, custom headers, or startup command required.\n\n\
+             Configure for your client:\n\
+             - Claude Code (including Claude Desktop Code): run `claude mcp add --transport http --scope user hipshell {c_url}` for all projects, \
+             or write the JSON below into `.mcp.json` in the project root.\n\
+             - Codex: add two lines to `~/.codex/config.toml`: `[mcp_servers.hipshell]` and `url = \"{c_url}\"`.\n\
+             - Other clients (Cursor, etc.): add this JSON (`mcpServers` format) to your MCP config:\n{z_pretty}\n\n\
+             Reload MCP and call `state` on `hipshell` to verify you can see the session list.\n\n\
+             Notes: Keep HiPShell running while in use; no host IP, username, or password is needed; \
+             only hosts with \"Allow AI (MCP) access to this host\" enabled in HiPShell can be accessed. Full usage is in the server instructions."
+        )
+    } else {
+        format!(
+            "请把本机的 HiPShell 注册为你的 MCP 服务器 (HTTP 方式, 即 Streamable HTTP). 只需配置一次.\n\n\
+             - 名称: hipshell\n- 网址: {c_url}\n- 不需要令牌、请求头或启动命令.\n\n\
+             按你所在的客户端登记:\n\
+             - Claude Code (含 Claude Desktop 的 Code): 所有项目可用请运行 claude mcp add --transport http --scope user hipshell {c_url}; \
+             只给当前项目用则在项目根目录的 .mcp.json 写入下面的 JSON.\n\
+             - Codex: 在 ~/.codex/config.toml 加入两行: [mcp_servers.hipshell] 与 url = \"{c_url}\".\n\
+             - 其他客户端 (Cursor 等): 写入其 MCP 配置文件, 通用 JSON (mcpServers 格式):\n{z_pretty}\n\n\
+             登记后重新加载 MCP, 并调用 hipshell 的 state 工具确认能看到会话列表.\n\n\
+             说明: 使用时 HiPShell 需要保持运行; 不需要服务器地址、账号或密码; \
+             只有在 HiPShell 中勾选“允许 AI 操作此服务器”的服务器可以被操作. 具体用法在连接后的 instructions 中."
+        )
+    }
+}
 // MCP 设置页: 开关、端口草稿与运行状态; 运行中时生成网址、JSON 配置和交给 AI 的安装说明.
 fn apply_mcp_settings(c_ui: &AppWindow, c_enabled: bool, c_port: u64, c_status: &std::result::Result<String, String>) {
     c_ui.set_mcp_enabled(c_enabled);
     c_ui.set_mcp_port(c_port as i32);
     c_ui.set_mcp_port_draft(c_port as i32);
-    // 开关或端口变了, 旧的自检结果不再适用.
+    // 开关或端口变了, 作废在途自检并清空旧结论.
+    MCP_CHECK_GEN.fetch_add(1, Ordering::AcqRel);
+    c_ui.set_mcp_checking(false);
     c_ui.set_mcp_check_title("".into());
+    c_ui.set_mcp_check_detail("".into());
     let Ok(z_url) = c_status else {
         c_ui.set_mcp_url("".into());
         c_ui.set_mcp_config("".into());
         c_ui.set_mcp_prompt("".into());
-        c_ui.set_mcp_error(if c_enabled { c_status.clone().err().unwrap_or_default() } else { String::new() }.into());
+        c_ui.set_mcp_error(if c_enabled {
+            c_status.as_ref().err().map(|c| friendly_error(c)).unwrap_or_default()
+        } else {
+            String::new()
+        }.into());
         return;
     };
-    let z_config = json!({"mcpServers":{"hipshell":{"type":"http","url":z_url}}});
-    // 交给 AI 的一次性安装说明: 网址固定, 按常见客户端列出登记方式, 其余客户端用通用 JSON.
-    let z_prompt = format!(
-        "请把本机的 HiPShell 注册为你的 MCP 服务器 (HTTP 方式, 即 Streamable HTTP). 只需配置一次.\n\n\
-         - 名称: hipshell\n- 网址: {z_url}\n- 不需要令牌、请求头或启动命令.\n\n\
-         按你所在的客户端登记:\n\
-         - Claude Code (含 Claude Desktop 的 Code): 所有项目可用请运行 claude mcp add --transport http --scope user hipshell {z_url}; \
-         只给当前项目用则在项目根目录的 .mcp.json 写入下面的 JSON.\n\
-         - Codex: 在 ~/.codex/config.toml 加入两行: [mcp_servers.hipshell] 与 url = \"{z_url}\".\n\
-         - 其他客户端 (Cursor 等): 写入其 MCP 配置文件, 通用 JSON (mcpServers 格式):\n{}\n\n\
-         登记后重新加载 MCP, 并调用 hipshell 的 state 工具确认能看到会话列表.\n\n\
-         说明: 使用时 HiPShell 需要保持运行; 不需要服务器地址、账号或密码; \
-         只有在 HiPShell 中勾选“允许 MCP 使用此连接”的服务器可以被操作. 具体用法在连接后的 instructions 中.",
-        serde_json::to_string_pretty(&z_config).unwrap_or_default(),
-    );
+    let z_config = json!({"mcpServers":{"hipshell":{"type":"http","url":z_url}}}).to_string();
+    let z_prompt = build_mcp_prompt(z_url, &z_config);
     c_ui.set_mcp_error("".into());
     c_ui.set_mcp_url(z_url.as_str().into());
-    c_ui.set_mcp_config(z_config.to_string().into());
+    c_ui.set_mcp_config(z_config.into());
     c_ui.set_mcp_prompt(z_prompt.into());
 }
 

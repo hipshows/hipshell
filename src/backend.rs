@@ -142,6 +142,8 @@ struct State {
     tabs: Vec<ConnectionTab>,
     tasks: HashMap<String, Arc<Mutex<Task>>>,
     active_session_id: Option<String>,
+    // 监控侧栏是否展开: 与 active_session_id/sessions 共用同一把 state 锁, 避免启停竞态泄漏后台监控任务.
+    monitor_enabled: bool,
     mcp_running: bool,
     // MCP 会话标识 -> (客户端名称, 最近请求时间); 超时未请求即视为离线.
     mcp_clients: HashMap<String, (String, Instant)>,
@@ -203,8 +205,13 @@ struct LiveSession {
     terminal: Mutex<Terminal>,
     // 终端通道已打开或正在打开; 终端退出后 SSH 连接保留, 文件传输和独立命令照常使用.
     shell: AtomicBool,
+    // 终端 PTY 与 Shell 已由服务端确认就绪: 仅在确认后才允许启动监控脚本, 避免登录握手或仅 SFTP 账号抢开监控通道.
+    shell_ready: AtomicBool,
     shell_stop: Mutex<Option<oneshot::Sender<()>>>,
-    monitoring: AtomicBool,
+    // 监控任务控制: (代次, 停止信号). 代次递增保证快速收起再展开时旧任务收尾不会清除新任务句柄.
+    monitor_ctrl: Mutex<(u64, Option<oneshot::Sender<()>>)>,
+    // 远端已明确返回无 /proc (退出码 42), 再次展开侧栏时不重复拉起脚本.
+    monitor_unsupported: AtomicBool,
     trust: Mutex<Option<TrustPrompt>>,
     // 待回答的认证请求: (随机请求标识, 提示, 回答通道). 三者放在一起: 状态快照拿到的提示与标识一定属于同一轮,
     // 界面带回标识在同一把锁内核对并取走, 迟到或重复的回答不会交给下一轮.
@@ -251,26 +258,165 @@ impl SshLink {
     }
 
     fn transfer_idle(&self) -> bool {
-        mono_ms().saturating_sub(self.state.last_rx.load(Ordering::Relaxed)) >= TRANSFER_IDLE_PROBE_MS
+        mono_ms().saturating_sub(self.state.last_rx_mono()) >= TRANSFER_IDLE_PROBE_MS
     }
 
     async fn probe_transfer(&self) -> bool {
         if stale_opens(self.key(), Duration::from_secs(30)) != 0 || !ssh_ping(&self.handle, 10).await {
             return false;
         }
-        self.state.last_rx.store(mono_ms(), Ordering::Relaxed);
+        self.state.mark_pong();
         true
     }
 }
 
-// 每条 SSH 连接各有一份状态. 旧传输连接退役后可能仍在收包或回调断开.
+// 每条 SSH 连接的运行期统计与断连诊断状态. 旧传输连接退役后可能仍在收包或回调断开.
 #[derive(Default)]
 struct SshLinkState {
-    // 连接建立时刻的单调时钟毫秒数, 用于断连诊断展示已连接时长.
-    connected_at: AtomicU64,
-    // 最近收到通道数据或主动探活回复的单调时钟毫秒数 (见 mono_ms).
-    last_rx: AtomicU64,
-    error: Mutex<Option<String>>,
+    // 读写热路径计数器: 全无锁更新, 供断连诊断和传输空闲判定使用.
+    rx_bytes: AtomicU64,
+    tx_bytes: AtomicU64,
+    last_tcp_rx_mono: AtomicU64,
+    last_tcp_tx_mono: AtomicU64,
+    last_data_mono: AtomicU64,
+    last_pong_mono: AtomicU64,
+    // 休眠时钟采样的 1 秒无锁节流门控, 避免高频收包重复加锁.
+    rx_clock_gate_mono: AtomicU64,
+    kex_count: AtomicU64,
+    // 本端主动断开、取消或退役时标记, 避免把正常关闭记入断连诊断与日志.
+    user_closed: AtomicBool,
+    diag: Mutex<LinkDiag>,
+}
+
+#[derive(Default, Clone)]
+struct LinkDiag {
+    // 认证通过后的上线时刻: 0 表示尚未完成认证, 握手/认证期断连不计入已建连断连日志.
+    connected_mono: u64,
+    connected_awake: u64,
+    connected_wall: u64,
+    // 最近一次收包/探活时刻的 (休眠停表毫秒, 墙钟毫秒), 成对更新避免数据撕裂.
+    rx_clock_awake: u64,
+    rx_clock_wall: u64,
+    // watch_connection 观测到的系统休眠跨度 (与 awake/wall 差值互为兜底).
+    sleep_secs: u64,
+    sleep_at_mono: u64,
+    via_proxy: bool,
+    local_addr: Option<std::net::SocketAddr>,
+    peer_addr: Option<std::net::SocketAddr>,
+    remote_sshid: String,
+    cipher: String,
+    kex: String,
+    strict_kex: bool,
+    error: Option<String>,
+    detail: Option<String>,
+}
+
+impl SshLinkState {
+    fn mark_route(
+        &self,
+        c_via_proxy: bool,
+        c_local: Option<std::net::SocketAddr>,
+        c_peer: Option<std::net::SocketAddr>,
+    ) {
+        let mut z_diag = self.diag.lock().unwrap_or_else(PoisonError::into_inner);
+        z_diag.via_proxy = c_via_proxy;
+        z_diag.local_addr = c_local;
+        z_diag.peer_addr = c_peer;
+    }
+
+    fn mark_authenticated(&self) {
+        let mut z_diag = self.diag.lock().unwrap_or_else(PoisonError::into_inner);
+        z_diag.connected_mono = mono_ms();
+        z_diag.connected_awake = awake_ms();
+        z_diag.connected_wall = epoch_ms();
+    }
+
+    fn touch_rx_clock(&self, c_mono: u64) {
+        let z_prev = self.rx_clock_gate_mono.load(Ordering::Relaxed);
+        if z_prev != 0 && c_mono.saturating_sub(z_prev) < 1000 {
+            return;
+        }
+        self.rx_clock_gate_mono.store(c_mono, Ordering::Relaxed);
+        let mut z_diag = self.diag.lock().unwrap_or_else(PoisonError::into_inner);
+        z_diag.rx_clock_awake = awake_ms();
+        z_diag.rx_clock_wall = epoch_ms();
+    }
+
+    fn mark_data(&self) {
+        let z_mono = mono_ms();
+        self.last_data_mono.store(z_mono, Ordering::Relaxed);
+        self.touch_rx_clock(z_mono);
+    }
+
+    fn mark_pong(&self) {
+        let z_mono = mono_ms();
+        self.last_pong_mono.store(z_mono, Ordering::Relaxed);
+        self.touch_rx_clock(z_mono);
+    }
+
+    fn mark_kex(&self, c_names: &russh::Names, c_sshid: &[u8]) {
+        let z_mono = mono_ms();
+        self.kex_count.fetch_add(1, Ordering::Relaxed);
+        self.rx_clock_gate_mono.store(z_mono, Ordering::Relaxed);
+        let mut z_diag = self.diag.lock().unwrap_or_else(PoisonError::into_inner);
+        z_diag.rx_clock_awake = awake_ms();
+        z_diag.rx_clock_wall = epoch_ms();
+        if z_diag.remote_sshid.is_empty() && !c_sshid.is_empty() {
+            z_diag.remote_sshid = safe_error(&String::from_utf8_lossy(c_sshid));
+        }
+        z_diag.cipher = c_names.cipher.as_ref().to_owned();
+        z_diag.kex = c_names.kex.as_ref().to_owned();
+        z_diag.strict_kex = c_names.strict_kex();
+    }
+
+    fn mark_tcp_rx(&self, c_bytes: usize) {
+        self.rx_bytes.fetch_add(c_bytes as u64, Ordering::Relaxed);
+        self.last_tcp_rx_mono.store(mono_ms(), Ordering::Relaxed);
+    }
+
+    fn mark_tcp_tx(&self, c_bytes: usize) {
+        self.tx_bytes.fetch_add(c_bytes as u64, Ordering::Relaxed);
+        self.last_tcp_tx_mono.store(mono_ms(), Ordering::Relaxed);
+    }
+
+    fn mark_user_closed(&self) {
+        self.user_closed.store(true, Ordering::Release);
+    }
+
+    fn record_sleep(&self, c_secs: u64) {
+        let mut z_diag = self.diag.lock().unwrap_or_else(PoisonError::into_inner);
+        z_diag.sleep_secs = c_secs;
+        z_diag.sleep_at_mono = mono_ms();
+    }
+
+    fn last_rx_mono(&self) -> u64 {
+        self.last_tcp_rx_mono
+            .load(Ordering::Relaxed)
+            .max(self.last_data_mono.load(Ordering::Relaxed))
+            .max(self.last_pong_mono.load(Ordering::Relaxed))
+    }
+
+    fn has_error(&self) -> bool {
+        self.diag.lock().unwrap_or_else(PoisonError::into_inner).error.is_some()
+    }
+
+    fn error(&self) -> Option<String> {
+        self.diag.lock().unwrap_or_else(PoisonError::into_inner).error.clone()
+    }
+
+    fn detail(&self) -> Option<String> {
+        self.diag.lock().unwrap_or_else(PoisonError::into_inner).detail.clone()
+    }
+
+    fn set_error_once(&self, c_error: String, c_detail: Option<String>) -> bool {
+        let mut z_diag = self.diag.lock().unwrap_or_else(PoisonError::into_inner);
+        if z_diag.error.is_some() {
+            return false;
+        }
+        z_diag.error = Some(c_error);
+        z_diag.detail = c_detail;
+        true
+    }
 }
 
 // 补全后的目录条目, 以及服务器时区与时间提示.
@@ -744,6 +890,7 @@ struct Task {
     // 文件夹任务: bytes 与 total 为整个文件夹, 下面几项为文件计数和当前文件; base_bytes 是已结束文件的字节数.
     directory: bool,
     files_done: u64,
+    files_failed: u64,
     files_total: u64,
     current: String,
     file_bytes: u64,
@@ -776,6 +923,52 @@ impl Backend {
             terminal_changed: tokio::sync::Notify::new(),
             mcp_http: tokio::sync::Mutex::new((None, Err("MCP 服务未启动".into()))),
         })
+    }
+
+    // 界面同步监控侧栏展开状态: 仅在展开时对当前活跃且带终端的会话启动监控脚本.
+    pub fn set_monitor_enabled(&self, c_enabled: bool) {
+        {
+            let mut l_state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            l_state.monitor_enabled = c_enabled;
+        }
+        self.sync_monitors();
+    }
+
+    // 按监控开关与当前活跃标签启停各会话的远端监控通道:
+    // 在持 state 锁内统一决定并更新各会话的 monitor_ctrl 代次与停止句柄, 锁外发送停止信号和派生任务, 避免 TOCTOU 竞态泄漏.
+    fn sync_monitors(&self) {
+        let mut z_to_start: Vec<(Arc<LiveSession>, u64, oneshot::Receiver<()>)> = Vec::new();
+        let mut z_to_stop: Vec<(Arc<LiveSession>, Option<oneshot::Sender<()>>)> = Vec::new();
+        {
+            let l_state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let l_enabled = l_state.monitor_enabled;
+            let l_active = l_state.active_session_id.as_deref();
+            for l_session in l_state.sessions.values() {
+                let l_want = l_enabled
+                    && l_active == Some(l_session.id.as_str())
+                    && l_session.shell_ready.load(Ordering::Acquire)
+                    && l_session.status.lock().is_ok_and(|c| c.as_str() == "connected");
+                if l_want {
+                    if let Some((l_gen, l_rx)) = reserve_monitor(l_session) {
+                        z_to_start.push((l_session.clone(), l_gen, l_rx));
+                    }
+                } else {
+                    let l_tx = disarm_monitor(l_session);
+                    if l_tx.is_some() || !l_session.monitor_unsupported.load(Ordering::Acquire) {
+                        z_to_stop.push((l_session.clone(), l_tx));
+                    }
+                }
+            }
+        }
+        for (l_session, l_tx) in z_to_stop {
+            if let Some(l_tx) = l_tx {
+                let _ = l_tx.send(());
+            }
+            clear_monitor_if_idle(&l_session);
+        }
+        for (l_session, l_gen, l_rx) in z_to_start {
+            spawn_monitor(l_session, l_gen, l_rx);
+        }
     }
 
     pub async fn call(
@@ -838,6 +1031,12 @@ impl Backend {
                     .context("主题设置需要布尔值")?;
                 self.store.set_dark_theme(z_dark)?;
                 Ok(json!({"dark_theme":z_dark}))
+            }
+            "set_language" => {
+                require_user(c_actor)?;
+                let z_lang = required_string(&c_args, "language")?;
+                self.store.set_language(z_lang)?;
+                Ok(json!({"language":z_lang}))
             }
             "set_tab_show_group" => {
                 require_user(c_actor)?;
@@ -959,7 +1158,7 @@ impl Backend {
                 Ok(json!({"count":self.commands.export(Path::new(required_string(&c_args, "path")?))?}))
             }
             "send_command" => self.send_command(c_args, c_actor).await,
-            "list_local_files" => self.list_local_files(c_args).await,
+            "list_local_files" => self.list_local_files(c_args, c_actor).await,
             "import_finalshell" => self.import_finalshell(c_args, c_actor),
             "export_finalshell" => self.export_finalshell(c_args, c_actor),
             "remove_connection" => self.remove_connection(c_args, c_actor),
@@ -978,6 +1177,8 @@ impl Backend {
                 if let Some(z_stop) = z_session.shell_stop.lock().unwrap_or_else(PoisonError::into_inner).take() {
                     let _ = z_stop.send(());
                 }
+                z_session.shell_ready.store(false, Ordering::Release);
+                stop_monitor(&z_session);
                 Ok(json!({"closed": true}))
             }
             "focus_session" => self.focus_session(c_args, c_actor),
@@ -995,7 +1196,7 @@ impl Backend {
             "file_details" => self.file_details(c_args, c_actor).await,
             "delete_files_fast" => self.delete_files_fast(c_args, c_actor).await,
             "copy_file" => self.copy_file(c_args, c_actor).await,
-            "upload_file" | "download_file" | "upload_directory" | "download_directory" => self.transfer(c_method, c_args, c_actor),
+            "upload_file" | "download_file" | "upload_directory" | "download_directory" => self.transfer(c_method, c_args, c_actor).await,
             "cancel_task" => self.cancel_task(c_args, c_actor),
             _ => bail!("未知操作: {c_method}"),
         };
@@ -1071,13 +1272,34 @@ impl Backend {
     }
 
     // 撤销授权或改了登录身份 (含代理) 后, 取消不再被允许的 MCP 任务. 编辑连接、删除代理、批量设置代理都会改变身份.
+    // 先在 state 锁内筛出仍在运行的 MCP 任务, 锁外读取磁盘配置核对权限, 避免持全局锁扫描全部历史任务.
     fn cancel_revoked_mcp_tasks(&self) {
+        let z_active: Vec<(Arc<Mutex<Task>>, Connection)> = {
+            let l_state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            l_state.tasks.values().filter_map(|c_task| {
+                let l_task = c_task.lock().ok()?;
+                (l_task.source == "mcp" && l_task.cancel.is_some()).then(|| (c_task.clone(), l_task.connection.clone()))
+            }).collect()
+        };
+        for (l_task, l_connection) in z_active {
+            if !self.store.get(&l_connection.id).is_ok_and(|c| mcp_permits(&c, &l_connection))
+                && let Ok(mut l_task) = l_task.lock()
+                && let Some(l_cancel) = l_task.cancel.take()
+            {
+                let _ = l_cancel.send(());
+            }
+        }
+    }
+
+    // 关闭全局 MCP 服务时同步取消仍在排队或运行的 MCP 后台任务.
+    fn cancel_all_mcp_tasks(&self) {
         let z_state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        for z_task in z_state.tasks.values() {
-            if let Ok(mut z_task) = z_task.lock() {
-                if z_task.source == "mcp" && !self.store.get(&z_task.connection.id).is_ok_and(|c| mcp_permits(&c, &z_task.connection)) {
-                    if let Some(z_cancel) = z_task.cancel.take() { let _ = z_cancel.send(()); }
-                }
+        for l_task in z_state.tasks.values() {
+            if let Ok(mut l_task) = l_task.lock()
+                && l_task.source == "mcp"
+                && let Some(l_cancel) = l_task.cancel.take()
+            {
+                let _ = l_cancel.send(());
             }
         }
     }
@@ -1159,12 +1381,22 @@ impl Backend {
         ).await
     }
 
-    async fn list_local_files(&self, c_args: Value) -> Result<Value> {
-        let z_path = PathBuf::from(required_string(&c_args, "path")?);
+    async fn list_local_files(&self, c_args: Value, c_actor: Actor) -> Result<Value> {
+        let z_raw = required_string(&c_args, "path")?;
+        ensure!(!z_raw.contains('\0'), "本地路径无效");
+        let z_path = PathBuf::from(z_raw);
+        ensure!(z_path.is_absolute(), "本机路径必须是绝对路径");
+        if c_actor == Actor::Mcp {
+            ensure!(!z_path.components().any(|c| matches!(c, std::path::Component::ParentDir)), "本机路径不能包含上级目录跳转 (..)");
+        }
+        let z_config_dir = self.store.directory().to_path_buf();
         // 本机目录不占用远端文件操作名额.
         tokio::task::spawn_blocking(move || -> Result<Value> {
             let z_path = z_path.canonicalize().context("本地目录不存在")?;
             ensure!(z_path.is_dir(), "请选择本地目录");
+            if c_actor == Actor::Mcp {
+                ensure!(!path_in_dir(&z_path, &z_config_dir), "禁止 MCP 访问 HiPShell 配置目录");
+            }
             let mut z_entries = Vec::new();
             let mut z_name_bytes = 0usize;
             let mut z_truncated = false;
@@ -1256,6 +1488,8 @@ impl Backend {
             connection_id: None,
         });
         z_state.active_session_id = Some(z_id.clone());
+        drop(z_state);
+        self.sync_monitors();
         Ok(json!({"session_id":z_id,"empty":true}))
     }
 
@@ -1342,8 +1576,10 @@ impl Backend {
             trust: Mutex::new(None),
             auth_answers: Mutex::new(None),
             shell: AtomicBool::new(false),
+            shell_ready: AtomicBool::new(false),
             shell_stop: Mutex::new(None),
-            monitoring: AtomicBool::new(false),
+            monitor_ctrl: Mutex::new((0, None)),
+            monitor_unsupported: AtomicBool::new(false),
             // 取消句柄在会话公开前装好: 刚登记就被断开时也能停下连接任务.
             connect_cancel: Mutex::new(Some(z_cancel_tx)),
             lease: Mutex::new(None),
@@ -1359,6 +1595,7 @@ impl Backend {
             z_state.active_session_id = Some(z_id.clone());
         }
         drop(z_state);
+        self.sync_monitors();
         let z_password = c_args
             .get("password")
             .and_then(Value::as_str)
@@ -1371,6 +1608,7 @@ impl Backend {
             tokio::select! {
                 _ = z_cancel_rx => {
                     set_status(&z_cancel_session, "disconnected".into());
+                    z_cancel_session.main_link.mark_user_closed();
                     // 连接任务此时已被丢弃: 它可能在断开摘走套接字之后才存入副本并启动握手, 由这里收尾关闭.
                     kill_socket(&z_cancel_session);
                 }
@@ -1448,6 +1686,7 @@ impl Backend {
         // 握手由 russh 在后台任务里进行, 放弃等待后它可能仍在等指纹确认或卡在密钥交换: 撤下弹窗并关闭套接字, 让握手随之结束.
         if !matches!(z_connected, Ok(Ok(_))) {
             c_session.trust.lock().unwrap_or_else(PoisonError::into_inner).take();
+            c_session.main_link.mark_user_closed();
             kill_socket(&c_session);
         }
         let mut z_handle = match z_connected {
@@ -1542,6 +1781,7 @@ impl Backend {
             Ok(true) => {}
             Ok(false) => {
                 set_status(&c_session, "authentication_failed".into());
+                c_session.main_link.mark_user_closed();
                 kill_socket(&c_session);
                 return;
             }
@@ -1550,6 +1790,7 @@ impl Backend {
                     &c_session,
                     format!("error: {}", safe_error(&err.to_string())),
                 );
+                c_session.main_link.mark_user_closed();
                 kill_socket(&c_session);
                 return;
             }
@@ -1558,9 +1799,11 @@ impl Backend {
             && !self.mcp_permitted(&c_session.connection)
         {
             set_status(&c_session, "error: 此连接已撤销 MCP 授权".into());
+            c_session.main_link.mark_user_closed();
             kill_socket(&c_session);
             return;
         }
+        c_session.main_link.mark_authenticated();
         let z_handle = Arc::new(z_handle);
         *c_session.handle.lock().unwrap_or_else(PoisonError::into_inner) = Some(z_handle.clone());
         watch_connection(&self, &c_session, &z_handle);
@@ -1632,8 +1875,9 @@ impl Backend {
         };
         // 终端就绪后才标记已连接, 界面随后才打开 SFTP 读目录, 与登录过程错开.
         set_status(c_session, "connected".into());
-        // 监控的采样命令在终端启动后再开始: 与登录同时打开的命令会话会让部分系统 (Ubuntu pam_motd) 不显示登录欢迎信息.
-        start_monitor(c_session);
+        c_session.shell_ready.store(true, Ordering::Release);
+        // 监控的采样命令在终端启动后且侧栏展开、为当前标签时才启动: 既避开登录欢迎信息 (Ubuntu pam_motd), 又避免后台挂机持续拉流.
+        self.sync_monitors();
         let (mut z_reader, z_writer) = z_channel.split();
         // 终端协议回复 (光标位置、设备属性等) 走单独的有界队列: 不与用户输入争用, 输入队列满时远端等待的回复也能发出.
         // 读取循环只能 try_send, 不能等待, 否则会卡住整条连接的收包; 回复队列满时才丢弃.
@@ -1795,13 +2039,13 @@ impl Backend {
         // 短暂等待后再判定, 避免先误清屏显示"终端已关闭"再跳成断线状态.
         if !z_stopped && z_channel_dropped && !c_handle.is_closed() {
             for _ in 0..10 {
-                if c_handle.is_closed() || c_session.main_link.error.lock().unwrap_or_else(PoisonError::into_inner).is_some() {
+                if c_handle.is_closed() || c_session.main_link.has_error() {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         }
-        if !z_stopped && (c_handle.is_closed() || c_session.main_link.error.lock().unwrap_or_else(PoisonError::into_inner).is_some()) {
+        if !z_stopped && (c_handle.is_closed() || c_session.main_link.has_error()) {
             close_session(c_session, &dropped_status(c_session).await, true);
             c_session.handle.lock().unwrap_or_else(PoisonError::into_inner).take();
         } else {
@@ -1913,6 +2157,8 @@ impl Backend {
         let mut z_state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         ensure!(z_state.tabs.iter().any(|c| c.id == z_id), "标签已关闭");
         z_state.active_session_id = Some(z_id.clone());
+        drop(z_state);
+        self.sync_monitors();
         Ok(json!({"focused": true,"session_id":z_id}))
     }
 
@@ -2284,6 +2530,7 @@ impl Backend {
         if let Some(z_newer) = &z_newer {
             close_session(z_newer, "disconnected", false);
         }
+        self.sync_monitors();
         for z_closed in z_session.iter().chain(z_newer.iter()) {
             let z_handle = z_closed.handle.lock().unwrap_or_else(PoisonError::into_inner).take();
             let z_socket = z_closed.socket.lock().unwrap_or_else(PoisonError::into_inner).take();
@@ -2393,6 +2640,7 @@ impl Backend {
 
     async fn list_files(self: &Arc<Self>, c_session: &Arc<LiveSession>, c_args: &Value, c_actor: Actor, c_seq: u64, c_operation: &mut BrowseOperation) -> Result<Value> {
         let z_dirs_only = c_args.get("dirs_only").and_then(Value::as_bool) == Some(true);
+        let z_names_only = c_args.get("names_only").and_then(Value::as_bool) == Some(true);
         let z_request = c_args
             .get("path")
             .and_then(Value::as_str)
@@ -2453,10 +2701,10 @@ impl Backend {
             }
         });
         let (z_path, (mut entries, truncated, owner_ids), z_ancestors) = z_result_rx.await.context("读取目录任务异常")??;
-        // 目录树只需子目录名: 不查属主和时间, 也不占用文件列表的补全槽位.
+        // 目录树只需子目录名, 上传"保留两者"只需已有文件名: 均不查属主和时间, 也不顶掉当前目录的补全槽位.
         // 读取期间标签已重连 (同一会话 ID 换了新连接): 旧连接的列表不再返回, 免得界面察觉重连前把它当新连接的列表启用文件操作.
         let z_current = || self.state.lock().unwrap_or_else(PoisonError::into_inner).sessions.get(&c_session.id).is_some_and(|c| Arc::ptr_eq(c, c_session));
-        if z_dirs_only {
+        if z_dirs_only || z_names_only {
             ensure!(z_current(), "标签已重新连接, 请刷新目录");
             sort_remote_entries(&mut entries);
             return Ok(json!({"session_id":c_session.id,"path":z_path,"entries":entries,"truncated":truncated}));
@@ -2838,7 +3086,7 @@ impl Backend {
         Ok(json!({"session_id":z_session.id,"path":z_target}))
     }
 
-    fn transfer(self: &Arc<Self>, c_method: &str, c_args: Value, c_actor: Actor) -> Result<Value> {
+    async fn transfer(self: &Arc<Self>, c_method: &str, c_args: Value, c_actor: Actor) -> Result<Value> {
         let z_upload = c_method.starts_with("upload");
         let z_directory = c_method.ends_with("_directory");
         // 文件夹传输只开放给界面, MCP 工具范围不变.
@@ -2846,27 +3094,41 @@ impl Backend {
             require_user(c_actor)?;
         }
         let z_session = self.session_args(&c_args, c_actor)?;
-        let local = PathBuf::from(required_string(&c_args, "local_path")?);
+        let z_local_raw = required_string(&c_args, "local_path")?;
+        ensure!(!z_local_raw.contains('\0'), "本机路径无效");
+        let local = PathBuf::from(z_local_raw);
         // 相对路径会按程序工作目录解析, 文件落到用户想不到的位置; Windows 上还要求带盘符.
-        ensure!(local.is_absolute(), "本机路径必须是绝对路径");
+        ensure!(local.is_absolute() && local.file_name().is_some(), "本机路径必须是有效绝对路径");
+        if c_actor == Actor::Mcp {
+            ensure!(!local.components().any(|c| matches!(c, std::path::Component::ParentDir)), "本机路径不能包含上级目录跳转 (..)");
+        }
         let remote = required_string(&c_args, "remote_path")?.to_owned();
         validate_remote_file_path(&remote)?;
         let overwrite = c_args.get("overwrite")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-        let z_total = if z_upload {
-            let l_metadata = local.metadata().context("读取上传源文件信息失败")?;
-            ensure!(if z_directory { l_metadata.is_dir() } else { l_metadata.is_file() }, "上传源不存在");
-            (!z_directory).then_some(l_metadata.len())
-        } else if c_actor == Actor::User && !z_directory {
-            // 界面列表的长度仅用于排队进度, 开始传输后以实际文件信息为准.
-            c_args.get("size_hint").and_then(Value::as_u64)
-        } else {
-            None
-        };
-        if !z_upload {
-            ensure!(!local.exists() || overwrite, "下载目标已存在");
-        }
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let z_size_hint = (c_actor == Actor::User && !z_upload && !z_directory)
+            .then(|| c_args.get("size_hint").and_then(Value::as_u64))
+            .flatten();
+        let z_config_dir = self.store.directory().to_path_buf();
+        let z_local_check = local.clone();
+        // 本地元数据、悬空符号链接与 MCP 配置目录隔离放到阻塞线程核对, 避免慢速挂载盘卡住 Tokio 工作线程.
+        let z_total = tokio::task::spawn_blocking(move || -> Result<Option<u64>> {
+            if c_actor == Actor::Mcp {
+                ensure!(!path_in_dir(&z_local_check, &z_config_dir), "禁止 MCP 访问 HiPShell 配置目录");
+            }
+            if z_upload {
+                let l_metadata = z_local_check.metadata().context("读取上传源文件信息失败")?;
+                ensure!(if z_directory { l_metadata.is_dir() } else { l_metadata.is_file() }, "上传源不存在");
+                Ok((!z_directory).then_some(l_metadata.len()))
+            } else {
+                // 使用 symlink_metadata 识别悬空符号链接, 避免 overwrite=false 直到下载完毕提交时才报错.
+                ensure!(std::fs::symlink_metadata(&z_local_check).is_err() || overwrite, "下载目标已存在");
+                Ok(z_size_hint)
+            }
+        })
+        .await
+        .context("检查本地路径异常")??;
         self.new_task(
             z_session,
             c_actor,
@@ -2972,6 +3234,7 @@ impl Backend {
             speed_samples: VecDeque::new(),
             directory: matches!(c_spec, TaskSpec::Transfer { directory: true, .. }),
             files_done: 0,
+            files_failed: 0,
             files_total: 0,
             current: String::new(),
             file_bytes: 0,
@@ -3397,6 +3660,7 @@ impl Backend {
                             z_first_error = l_error;
                         }
                         z_failed += 1;
+                        l_task.files_failed += 1;
                         l_task.total = l_task.total.map(|c| c.saturating_sub(z_size));
                     }
                 }
@@ -3535,21 +3799,25 @@ impl Backend {
             z_files.retain(|c| c.1.rsplit_once('/').is_some_and(|(l_parent, _)| z_ready.contains(l_parent)));
             return Ok((z_files, z_notes, z_failed));
         }
+        const MAX_DIRECTORY_DEPTH: usize = 64;
         let (z_raw, z_version, z_link) = self.open_transfer_raw(c_session, c_task, Some(c_link_used)).await?;
         let mut z_files = Vec::new();
         let mut z_notes = String::new();
         let mut z_dirs = Vec::new();
-        let mut z_pending = vec![(c_remote.to_owned(), c_local.to_path_buf())];
-        while let Some((l_remote, l_local)) = z_pending.pop() {
-            let l_entries = match read_remote_directory(&z_raw, &l_remote).await {
+        let mut z_pending = vec![(c_remote.to_owned(), c_local.to_path_buf(), 0usize)];
+        let mut z_clean = true;
+        while let Some((l_remote, l_local, l_depth)) = z_pending.pop() {
+            let (l_entries, l_closed) = match read_remote_directory(&z_raw, &l_remote).await {
                 Ok(c) => c,
                 // 只跳过服务器明确拒绝的子目录 (无权限等); 连接中断类状态和其他错误返回, 由外层重试, 不漏传目录.
                 Err(err) if z_dirs.is_empty() || !err.chain().any(|c| c.downcast_ref::<SftpError>().is_some_and(sftp_definite)) => return Err(err),
                 Err(err) => {
+                    z_clean = false;
                     directory_note(&mut z_notes, format!("跳过 {l_remote}: {err:#}"));
                     continue;
                 }
             };
+            z_clean &= l_closed;
             z_dirs.push(l_local.clone());
             // Windows 替换非法字符、不区分大小写的文件系统都可能让同目录两个远端名落到同一本机名, 后者不能覆盖前者.
             let mut l_seen = std::collections::HashSet::new();
@@ -3582,13 +3850,19 @@ impl Backend {
                 }
                 ensure!(z_files.len() + z_dirs.len() + z_pending.len() < MAX_DIRECTORY_ITEMS, "文件夹超过 {MAX_DIRECTORY_ITEMS} 项, 请分批传输");
                 if l_kind.is_dir() {
-                    z_pending.push((l_path, l_local.join(l_target)));
+                    // 限制最大深度, 防止 bind mount 环路或 READDIR 跟随符号链接的服务端无限展开.
+                    if l_depth >= MAX_DIRECTORY_DEPTH {
+                        directory_note(&mut z_notes, format!("跳过 {l_path}: 目录层级超过 {MAX_DIRECTORY_DEPTH} 层"));
+                        continue;
+                    }
+                    z_pending.push((l_path, l_local.join(l_target), l_depth + 1));
                 } else {
                     z_files.push((l_local.join(l_target), l_path, l_attrs.size.unwrap_or(0)));
                 }
             }
         }
-        if let Some((l_link, l_alive)) = z_link {
+        // 只在所有目录句柄均确认关闭后放回空闲池, 防止残留未关闭目录句柄污染后续复用.
+        if z_clean && let Some((l_link, l_alive)) = z_link {
             put_idle_sftp(c_session, l_link, l_alive, (z_raw, z_version));
         } else {
             drop(z_raw);
@@ -3702,7 +3976,7 @@ impl Backend {
             }
         }
         if let Some(l_link) = z_slot.0.take() {
-            retire_transfer(c_session, l_link.handle);
+            retire_transfer(c_session, l_link);
         }
         // 先确认有可复用的凭据, 没有 (键盘交互认证等) 时不必先建连再失败.
         let z_auth = c_session.transfer_auth.lock().unwrap_or_else(PoisonError::into_inner).clone();
@@ -3728,7 +4002,8 @@ impl Backend {
                             }
                             l_published.0 = l_socket.take();
                         }
-                        l_state.last_rx.store(mono_ms(), Ordering::Relaxed);
+                        l_state.mark_authenticated();
+                        l_state.mark_pong();
                         let l_link = SshLink { handle: Arc::new(l_handle), state: l_state, dedicated: true };
                         *c_session.transfer_suspect.lock().unwrap_or_else(PoisonError::into_inner) = (l_link.key(), false);
                         z_slot.0 = Some(l_link.clone());
@@ -3947,8 +4222,9 @@ impl Backend {
                 Ok(l_opened.handle)
             };
             // 检查目标与打开临时文件同时发出, 省一次往返. 临时文件不影响目标; 下面报错时由调用方按归属清理.
+            // 用 lstat 而非 stat: 识别悬空符号链接并避免沿符号链接覆写, 同时禁止把已有远端目录当作文件覆写.
             let (z_stat, z_opened) = tokio::join!(
-                tokio::time::timeout(Duration::from_secs(15), z_raw.stat(c_remote.clone())),
+                tokio::time::timeout(Duration::from_secs(15), z_raw.lstat(c_remote.clone())),
                 z_open,
             );
             // 只有"不存在"算正常结果; 超时、权限和连接错误直接报错.
@@ -3960,6 +4236,11 @@ impl Backend {
             };
             let z_exists = z_existing.is_some();
             ensure!(c_overwrite || !z_exists, "远端目标已存在");
+            if let Some(l_existing) = &z_existing {
+                let l_kind = l_existing.attrs.file_type();
+                ensure!(!l_kind.is_dir(), "远端目标已是目录, 无法作为文件覆写");
+                ensure!(!l_kind.is_symlink(), "远端目标是符号链接, 无法覆写");
+            }
             let z_handle = z_opened?;
             // 仅续传需要定位, 首次打开的本地句柄已经在文件开头.
             if z_check_resume {
@@ -3981,6 +4262,10 @@ impl Backend {
                 let mut z_unconfirmed = BTreeSet::new();
                 // 只测本次实际发送的数据. 续传的已有字节不计入进度用时.
                 let z_data_start = Instant::now();
+                // 近 2 秒滚动速率用于滑窗收放, 避免大文件前半段高速拉高全程均值后遇限速无法及时收缩窗口.
+                let mut z_rate_at = z_data_start;
+                let mut z_rate_bytes = z_start;
+                let mut z_recent_rate: Option<f64> = None;
                 let z_send_size = total - z_start;
                 let z_checkpoints = [z_send_size.div_ceil(20), z_send_size.div_ceil(4), z_send_size.div_ceil(2), z_send_size];
                 let mut z_first_send = None;
@@ -4015,7 +4300,7 @@ impl Backend {
                         if !z_reading && z_writes.is_empty() {
                             break None;
                         }
-                        let l_target = transfer_target_window(z_window, z_max_window, z_acked - z_start, z_data_start.elapsed(), UPLOAD_CHUNK, 6.0);
+                        let l_target = transfer_target_window(z_window, z_max_window, z_acked - z_start, z_data_start.elapsed(), z_recent_rate, UPLOAD_CHUNK, 6.0);
                         let l_can_queue = z_reading && z_writes.len() < l_target;
                         tokio::select! {
                             biased;
@@ -4038,6 +4323,12 @@ impl Backend {
                                 c_resume.0 = l_contiguous;
                                 update_progress(c_task, z_acked, total, true);
                                 if z_acked > l_previous {
+                                    let l_rate_dt = z_rate_at.elapsed();
+                                    if l_rate_dt >= Duration::from_secs(2) {
+                                        z_recent_rate = Some((z_acked - z_rate_bytes) as f64 / l_rate_dt.as_secs_f64());
+                                        z_rate_at = Instant::now();
+                                        z_rate_bytes = z_acked;
+                                    }
                                     z_window = z_window.saturating_add(l_acked_blocks.saturating_mul(2)).min(z_max_window);
                                     z_ack_timeout.as_mut().reset(tokio::time::Instant::now() + TRANSFER_STALL);
                                     let l_elapsed = z_data_start.elapsed();
@@ -4178,9 +4469,10 @@ impl Backend {
             }
         } else {
             use russh_sftp::protocol::{FileAttributes, OpenFlags, StatusCode};
-            if let Ok(z_metadata) = tokio::fs::metadata(&c_local).await {
+            // 用 symlink_metadata 识别悬空符号链接与 Windows 目录符号链接 (mklink /D): 不覆盖时提前报错, 覆盖时拒绝目录与目录符号链接.
+            if let Ok(z_metadata) = tokio::fs::symlink_metadata(&c_local).await {
                 ensure!(c_overwrite, "本地目标已存在");
-                ensure!(z_metadata.is_file(), "本地目标必须是普通文件");
+                ensure!(!z_metadata.is_dir() && (z_metadata.is_file() || z_metadata.file_type().is_symlink()), "本地目标必须是普通文件");
             }
             // 下载改用 RawSftpSession 精确滑窗: 按文件总长派发读请求, 不越过 EOF 多发预读,
             // 遇短读仅补缺口而不清空后续并发请求, 完成后显式 close 句柄再放回统一空闲池.
@@ -4263,6 +4555,9 @@ impl Backend {
             update_progress(c_task, z_start, total, false);
             let mut count = z_start;
             let z_data_start = Instant::now();
+            let mut z_rate_at = z_data_start;
+            let mut z_rate_bytes = z_start;
+            let mut z_recent_rate: Option<f64> = None;
             let mut z_last_data_at = z_data_start;
             let mut z_read_elapsed = Duration::ZERO;
             let mut z_write_elapsed = Duration::ZERO;
@@ -4273,7 +4568,7 @@ impl Backend {
             // 按偏移顺序保存已派发的读请求: 队头按序落盘, 后台 SFTP 读任务独立消费后续回包, 无需乱序大缓存.
             let mut z_pending: VecDeque<(u64, u32, std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<russh_sftp::protocol::Data, russh_sftp::client::error::Error>> + Send>>)> = VecDeque::with_capacity(z_max_window);
             let z_read_result: Result<()> = loop {
-                let l_target = transfer_target_window(z_window, z_max_window, count - z_start, z_data_start.elapsed(), z_chunk_size, 8.0);
+                let l_target = transfer_target_window(z_window, z_max_window, count - z_start, z_data_start.elapsed(), z_recent_rate, z_chunk_size, 8.0);
                 while z_pending.len() < l_target && z_next_offset < total {
                     let l_offset = z_next_offset;
                     let l_len = (total - l_offset).min(z_chunk_size as u64) as u32;
@@ -4304,6 +4599,8 @@ impl Backend {
                 if l_data.is_empty() {
                     break Ok(());
                 }
+                // 防止异常或恶意服务端返回超过请求长度的数据导致后续并发块偏移错位.
+                ensure!(l_data.len() <= l_expected as usize, "服务器返回的数据块长度超出请求范围");
                 // 本机磁盘超时按 TimedOut 报出, 重试判断据此与网络超时区分, 不进入网络退避.
                 let l_write_at = Instant::now();
                 tokio::time::timeout(TRANSFER_STALL, dest.write_all(&l_data))
@@ -4339,6 +4636,12 @@ impl Backend {
                     }
                 }
                 count += l_got as u64;
+                let l_rate_dt = z_rate_at.elapsed();
+                if l_rate_dt >= Duration::from_secs(2) {
+                    z_recent_rate = Some((count - z_rate_bytes) as f64 / l_rate_dt.as_secs_f64());
+                    z_rate_at = Instant::now();
+                    z_rate_bytes = count;
+                }
                 // 本地落盘另有超时, 不把写盘耗时算作远端无数据等待.
                 z_last_data_at = Instant::now();
                 z_window = z_window.saturating_add(2).min(z_max_window);
@@ -4465,9 +4768,17 @@ impl Backend {
             l_task.abort();
             let _ = l_task.await;
         }
+        crate::mcp::reset_diagnostics();
+        if let Ok(mut l_state) = self.state.lock() {
+            l_state.mcp_clients.clear();
+        }
         let z_result = match self.store.settings() {
             Err(err) => Err(format!("{err:#}")),
-            Ok(l_settings) if !l_settings.mcp_enabled => Err("MCP 服务已关闭".into()),
+            Ok(l_settings) if !l_settings.mcp_enabled => {
+                self.cancel_all_mcp_tasks();
+                crate::mcp::clear_persisted_sessions(self.data_dir());
+                Err("MCP 服务已关闭".into())
+            }
             Ok(l_settings) => match crate::mcp::start_http(self.clone(), l_settings.mcp_port).await {
                 Ok((l_url, l_task)) => {
                     z_http.0 = Some(l_task);
@@ -4479,6 +4790,21 @@ impl Backend {
         self.set_mcp_running(z_result.is_ok());
         z_http.1 = z_result.clone();
         z_result
+    }
+
+    // 进程退出前立即停止 MCP 监听并释放端口, 保留持久化会话供下次启动无缝续接.
+    pub async fn stop_mcp(&self) {
+        let mut z_http = self.mcp_http.lock().await;
+        if let Some(l_task) = z_http.0.take() {
+            l_task.abort();
+            let _ = l_task.await;
+        }
+        crate::mcp::reset_diagnostics();
+        if let Ok(mut l_state) = self.state.lock() {
+            l_state.mcp_running = false;
+            l_state.mcp_clients.clear();
+        }
+        z_http.1 = Err("MCP 服务已关闭".into());
     }
 
     // 设置页修改开关与端口: 只由界面直接调用, 不经 call 分派, MCP 客户端无法改动自己的服务.
@@ -4574,7 +4900,8 @@ impl Backend {
                 .find(|c| c.id == session.connection.id)
                 .map(|c| c.group.as_str())
                 .unwrap_or(session.connection.group.as_str());
-            sessions.push(json!({"session_id":session.id,"link":session.link,"terminal":session.terminal_gen.load(Ordering::Acquire),"connection_id":session.connection.id,"name":session.connection.name,"group":z_group,"status":session.status.lock().map(|s|s.clone()).unwrap_or_default(),"shell":session.shell.load(Ordering::Acquire),"empty":false,"owner":if z_owner{"mcp"}else{"user"},"trust":trust,"auth_prompts":prompts,"auth_id":auth_id,"monitor":monitor,"latency_ms":(z_latency >= 0).then_some(z_latency)}));
+            let z_disconnect_detail = (c_actor == Actor::User).then(|| session.main_link.detail()).flatten();
+            sessions.push(json!({"session_id":session.id,"link":session.link,"terminal":session.terminal_gen.load(Ordering::Acquire),"connection_id":session.connection.id,"name":session.connection.name,"group":z_group,"status":session.status.lock().map(|s|s.clone()).unwrap_or_default(),"shell":session.shell.load(Ordering::Acquire),"empty":false,"owner":if z_owner{"mcp"}else{"user"},"trust":trust,"auth_prompts":prompts,"auth_id":auth_id,"monitor":monitor,"latency_ms":(z_latency >= 0).then_some(z_latency),"disconnect_detail":z_disconnect_detail}));
         }
         let mut tasks: Vec<(Instant, Value)> = z_state
             .tasks
@@ -4599,7 +4926,26 @@ impl Backend {
             })
             .collect();
         tasks.sort_by(|a, b| b.0.cmp(&a.0));
-        let tasks: Vec<Value> = tasks.into_iter().map(|(_, task)| task).collect();
+        let z_tasks_total = tasks.len();
+        let mut tasks: Vec<Value> = tasks.into_iter().map(|(_, task)| task).collect();
+        // MAX_TASKS 可达 2500 (单批 2000 项), MCP 单次响应上限 1 MiB / 2 MiB: 优先保留进行中与最近任务, 防止 state 永久超限.
+        const MCP_MAX_STATE_TASKS: usize = 200;
+        let z_tasks_truncated = c_actor == Actor::Mcp && tasks.len() > MCP_MAX_STATE_TASKS;
+        if z_tasks_truncated {
+            let mut l_active = Vec::new();
+            let mut l_done = Vec::new();
+            for l_task in tasks {
+                if matches!(l_task.get("status").and_then(Value::as_str), Some("queued" | "preparing" | "running" | "retrying" | "cancelling")) {
+                    l_active.push(l_task);
+                } else {
+                    l_done.push(l_task);
+                }
+            }
+            l_active.truncate(MCP_MAX_STATE_TASKS);
+            let l_rest = MCP_MAX_STATE_TASKS.saturating_sub(l_active.len());
+            l_active.extend(l_done.into_iter().take(l_rest));
+            tasks = l_active;
+        }
         // 当前标签已断开 (只剩标签) 时按标签记录的连接判断授权, 与上面 sessions 列出的离线标签一致.
         let active = z_state
             .active_session_id
@@ -4632,6 +4978,10 @@ impl Backend {
         if c_actor == Actor::Mcp {
             // MCP 只需连接、会话和任务; 设置与常用命令属于界面数据.
             let mut z_result = json!({"connections":z_connections,"sessions":sessions,"tasks":tasks,"active_session_id":active});
+            if z_tasks_truncated {
+                z_result["tasks_truncated"] = json!(true);
+                z_result["tasks_total"] = json!(z_tasks_total);
+            }
             // 未授权的连接对 AI 完全不可见, 列表为空时说明原因, 避免 AI 误判为通信或同步故障.
             if z_connections.is_empty() {
                 z_result["hint"] = json!("用户尚未授权任何连接给 MCP. 请用户在 HiPShell 连接编辑中勾选“允许 MCP 使用此连接”后再调用 state.");
@@ -4717,6 +5067,7 @@ struct TaskView {
     speed_bytes_per_sec: u64,
     directory: bool,
     files_done: u64,
+    files_failed: u64,
     files_total: u64,
     current: String,
     file_bytes: u64,
@@ -4757,6 +5108,7 @@ impl From<&Task> for TaskView {
             speed_bytes_per_sec: current_speed(t),
             directory: t.directory,
             files_done: t.files_done,
+            files_failed: t.files_failed,
             files_total: t.files_total,
             current: t.current.clone(),
             file_bytes: t.file_bytes,
@@ -4774,66 +5126,48 @@ impl From<&Task> for TaskView {
 
 impl client::Handler for SshHandler {
     type Error = russh::Error;
-    // 主连接和传输连接各自记下收到数据的时间.
+    // 主连接和传输连接各自记下收到业务数据、密钥交换与断开信息.
     async fn data(&mut self, _c_channel: russh::ChannelId, _c_data: &[u8], _c_session: &mut client::Session) -> std::result::Result<(), Self::Error> {
-        self.link.last_rx.store(mono_ms(), Ordering::Relaxed);
+        self.link.mark_data();
         Ok(())
     }
     async fn extended_data(&mut self, _c_channel: russh::ChannelId, _c_ext: u32, _c_data: &[u8], _c_session: &mut client::Session) -> std::result::Result<(), Self::Error> {
-        self.link.last_rx.store(mono_ms(), Ordering::Relaxed);
+        self.link.mark_data();
         Ok(())
     }
-    // 记录断开原因; 返回值与库默认实现一致. 本端主动关闭也会走到这里, 但那时状态已由关闭流程设置, 不会显示.
+    async fn kex_done(&mut self, _c_shared_secret: Option<&[u8]>, c_names: &russh::Names, c_session: &mut client::Session) -> std::result::Result<(), Self::Error> {
+        self.link.mark_kex(c_names, c_session.remote_sshid());
+        Ok(())
+    }
+    // 记录断开原因与诊断快照; 返回值与库默认实现一致. 本端主动关闭也会走到这里, 但 user_closed 已置位, 不写入断连日志.
     async fn disconnected(&mut self, c_reason: client::DisconnectReason<Self::Error>) -> std::result::Result<(), Self::Error> {
-        let (z_text, z_result) = match c_reason {
-            client::DisconnectReason::ReceivedDisconnect(l_info) => (
-                format!("服务器断开 ({:?}) {}", l_info.reason_code, safe_error(&l_info.message)),
-                Ok(()),
-            ),
-            client::DisconnectReason::Error(err) => (
-                match &err {
-                    russh::Error::KeepaliveTimeout => "保活超时, 长时间未收到服务器任何数据 (网络或代理链路中断)".to_owned(),
-                    russh::Error::InactivityTimeout => "无活动超时, 长时间数据未能发出或未收到数据 (网络或代理链路堵塞)".to_owned(),
-                    russh::Error::Disconnect => "连接被关闭, 未收到断开说明 (服务器、代理或网络中断)".to_owned(),
-                    russh::Error::IO(l_io) => match l_io.kind() {
-                        std::io::ErrorKind::UnexpectedEof => {
-                            use std::fmt::Write as _;
-                            let mut l_reason = "SSH 数据流提前结束, 未收到服务器断开通知".to_owned();
-                            if let Some(l_session) = self.session.upgrade() {
-                                l_reason.push_str(if l_session.connection.proxy_id.is_some() { " · 经代理" } else { " · 直连" });
-                            }
-                            let l_now = mono_ms();
-                            let l_since = self.link.connected_at.load(Ordering::Relaxed);
-                            if l_since != 0 {
-                                let l_secs = l_now.saturating_sub(l_since) / 1000;
-                                if l_secs >= 60 {
-                                    let _ = write!(l_reason, " · 已连接 {} 分 {} 秒", l_secs / 60, l_secs % 60);
-                                } else {
-                                    let _ = write!(l_reason, " · 已连接 {l_secs} 秒");
-                                }
-                            }
-                            let l_last = self.link.last_rx.load(Ordering::Relaxed);
-                            if l_last != 0 {
-                                let _ = write!(l_reason, " · 上次收到数据或探活回复在 {} 秒前", l_now.saturating_sub(l_last) / 1000);
-                            }
-                            let l_detail = l_io.to_string();
-                            if !l_detail.is_empty() && l_detail != "early eof" {
-                                let _ = write!(l_reason, " ({})", safe_error(&l_detail));
-                            }
-                            l_reason
-                        }
-                        std::io::ErrorKind::ConnectionReset => "连接被对端或代理重置 (Connection reset)".to_owned(),
-                        std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::BrokenPipe => "本地网络或代理链路已中断".to_owned(),
-                        std::io::ErrorKind::TimedOut => "网络读写超时, 连接已中断".to_owned(),
-                        _ => safe_error(&format!("网络错误: {l_io}")),
-                    },
-                    l_err => safe_error(&format!("网络错误: {l_err}")),
-                },
-                Err(err),
-            ),
+        let (z_summary, z_raw, z_result) = match c_reason {
+            client::DisconnectReason::ReceivedDisconnect(l_info) => {
+                let l_msg = safe_error(&l_info.message);
+                (
+                    format!("服务器断开 ({:?}) {l_msg}", l_info.reason_code),
+                    format!("ReceivedDisconnect({:?}: {l_msg})", l_info.reason_code),
+                    Ok(()),
+                )
+            }
+            client::DisconnectReason::Error(err) => {
+                let (l_summary, l_raw) = describe_ssh_error(&err);
+                (l_summary, l_raw, Err(err))
+            }
         };
-        // 探活判定失联后会关闭套接字, 随后的读写错误保留首次判定的原因.
-        self.link.error.lock().unwrap_or_else(PoisonError::into_inner).get_or_insert(z_text);
+        let z_target = self
+            .session
+            .upgrade()
+            .map(|c| format!("{} ({}:{})", c.connection.name, c.connection.host, c.connection.port))
+            .unwrap_or_else(|| "-".into());
+        record_link_disconnect(
+            &self.link,
+            self.store.directory(),
+            &z_target,
+            self.transfer,
+            &z_summary,
+            &z_raw,
+        );
         z_result
     }
     async fn check_server_key(
@@ -5079,6 +5413,8 @@ fn request_redraw(c_session: &Arc<LiveSession>, c_size: (u16, u16)) {
 fn shell_closed(c_session: &LiveSession, c_notice: &str) {
     c_session.terminal_tx.lock().unwrap_or_else(PoisonError::into_inner).take();
     c_session.resize_tx.lock().unwrap_or_else(PoisonError::into_inner).take();
+    c_session.shell_ready.store(false, Ordering::Release);
+    stop_monitor(c_session);
     // 清空旧画面并隐藏光标, 只留提示, 避免残留的光标停在旧位置像是还能输入.
     {
         let mut z_term = c_session.terminal.lock().unwrap_or_else(PoisonError::into_inner);
@@ -5088,17 +5424,58 @@ fn shell_closed(c_session: &LiveSession, c_notice: &str) {
     c_session.shell.store(false, Ordering::Release);
 }
 
-fn start_monitor(c_session: &Arc<LiveSession>) {
-    if c_session.monitoring.swap(true, Ordering::AcqRel) {
-        return;
+fn reserve_monitor(c_session: &LiveSession) -> Option<(u64, oneshot::Receiver<()>)> {
+    if c_session.monitor_unsupported.load(Ordering::Acquire) {
+        return None;
     }
-    let z_session = Arc::downgrade(c_session);
+    let mut l_ctrl = c_session.monitor_ctrl.lock().unwrap_or_else(PoisonError::into_inner);
+    if l_ctrl.1.is_some() {
+        return None;
+    }
+    l_ctrl.0 = l_ctrl.0.wrapping_add(1);
+    let (l_tx, l_rx) = oneshot::channel();
+    l_ctrl.1 = Some(l_tx);
+    Some((l_ctrl.0, l_rx))
+}
+
+fn spawn_monitor(c_session: Arc<LiveSession>, c_gen: u64, c_stop_rx: oneshot::Receiver<()>) {
+    let z_session = Arc::downgrade(&c_session);
     tokio::spawn(async move {
-        monitor_loop(z_session.clone()).await;
+        monitor_loop(z_session.clone(), c_stop_rx).await;
         if let Some(l_session) = z_session.upgrade() {
-            l_session.monitoring.store(false, Ordering::Release);
+            let mut l_ctrl = l_session.monitor_ctrl.lock().unwrap_or_else(PoisonError::into_inner);
+            if l_ctrl.0 == c_gen {
+                l_ctrl.1 = None;
+            }
+            // 停流收尾时若已无新监控接替且非 /proc 不支持, 清空旧采样, 防止在途包残留过期 MiniBar 或拼接断档曲线.
+            if l_ctrl.1.is_none() && !l_session.monitor_unsupported.load(Ordering::Acquire) {
+                *l_session.monitor.lock().unwrap_or_else(PoisonError::into_inner) = None;
+            }
         }
     });
+}
+
+fn disarm_monitor(c_session: &LiveSession) -> Option<oneshot::Sender<()>> {
+    let mut l_ctrl = c_session.monitor_ctrl.lock().unwrap_or_else(PoisonError::into_inner);
+    l_ctrl.0 = l_ctrl.0.wrapping_add(1);
+    l_ctrl.1.take()
+}
+
+fn clear_monitor_if_idle(c_session: &LiveSession) {
+    if c_session.monitor_unsupported.load(Ordering::Acquire) {
+        return;
+    }
+    let l_ctrl = c_session.monitor_ctrl.lock().unwrap_or_else(PoisonError::into_inner);
+    if l_ctrl.1.is_none() {
+        *c_session.monitor.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+}
+
+fn stop_monitor(c_session: &LiveSession) {
+    if let Some(l_tx) = disarm_monitor(c_session) {
+        let _ = l_tx.send(());
+    }
+    clear_monitor_if_idle(c_session);
 }
 
 // russh 在连接结束、回应通道被释放时同样返回 Ok, 需要核对连接仍在.
@@ -5113,6 +5490,8 @@ fn watch_connection(c_backend: &Arc<Backend>, c_session: &Arc<LiveSession>, c_ha
     let z_backend = Arc::downgrade(c_backend);
     let z_session = Arc::downgrade(c_session);
     let z_handle = c_handle.clone();
+    let z_log_dir = c_backend.store.directory().to_path_buf();
+    let z_target = format!("{} ({}:{})", c_session.connection.name, c_session.connection.host, c_session.connection.port);
     tokio::spawn(async move {
         // 活跃标签每 15 秒探活一次 (避免每 3 秒高频发送 keepalive@openssh.com 触发严格服务端或设备限制),
         // 非活跃标签或探活未回应时用 20 秒间隔; 本地状态检查与空闲会话回收仍保持 3 秒粒度.
@@ -5123,22 +5502,31 @@ fn watch_connection(c_backend: &Arc<Backend>, c_session: &Arc<LiveSession>, c_ha
         let mut z_checked_opens = z_probed;
         let mut z_first = true;
         let mut z_last_tick = Instant::now();
+        let mut z_last_wall = epoch_ms();
         let mut z_missed = 0u32;
         let mut z_stale_hits = 0u32;
         loop {
-            tokio::time::sleep(if z_first { Duration::from_secs(1) } else { z_tick }).await;
-            // 定时器间隔异常拉长 (如系统睡眠唤醒) 后清零累计次数, 留出网络恢复窗口.
-            if z_last_tick.elapsed() > Duration::from_secs(30) {
-                z_missed = 0;
-                z_stale_hits = 0;
-            }
+            let l_sleep_for = if z_first { Duration::from_secs(1) } else { z_tick };
+            tokio::time::sleep(l_sleep_for).await;
+            let l_mono_elapsed = z_last_tick.elapsed();
+            let l_wall_now = epoch_ms();
+            let l_tick_sleep = sleep_gap_secs(l_mono_elapsed, l_wall_now.saturating_sub(z_last_wall), l_sleep_for);
             z_last_tick = Instant::now();
+            z_last_wall = l_wall_now;
+
             let Some(l_session) = z_session.upgrade() else { break; };
             if !l_session.handle.lock().unwrap_or_else(PoisonError::into_inner).as_ref().is_some_and(|c| Arc::ptr_eq(c, &z_handle)) {
                 break;
             }
+            if let Some(l_secs) = l_tick_sleep {
+                // 休眠或进程长时间挂起后清零丢包计数并延后探测, 给唤醒后的网络恢复留出窗口.
+                l_session.main_link.record_sleep(l_secs);
+                z_missed = 0;
+                z_stale_hits = 0;
+                z_probed = z_last_tick;
+            }
             purge_idle_sftp(&l_session);
-            // 等会话进入 connected (PTY/Shell 启动完成或仅文件模式就绪) 后再首次探活, 避免登录握手期间抢发全局请求.
+
             let l_connected = l_session.status.lock().unwrap_or_else(PoisonError::into_inner).as_str() == "connected";
             let l_active = z_missed == 0 && z_backend.upgrade().is_some_and(|c| {
                 c.state.try_lock().is_ok_and(|l| l.active_session_id.as_deref() == Some(l_session.id.as_str()))
@@ -5147,50 +5535,26 @@ fn watch_connection(c_backend: &Arc<Backend>, c_session: &Arc<LiveSession>, c_ha
             if l_connected && !z_handle.is_closed() && (z_first || z_probed.elapsed() >= l_interval) {
                 z_first = false;
                 let l_ping_at = Instant::now();
+                let l_ping_wall = epoch_ms();
                 let l_pong = ssh_ping(&z_handle, 15).await;
                 z_probed = Instant::now();
+                // 探活最长可耗时 15 秒, 同步刷新 tick 基准避免下一轮误计入定时器漂移.
+                z_last_tick = z_probed;
+                z_last_wall = epoch_ms();
+                let l_ping_elapsed = l_ping_at.elapsed();
                 if l_pong {
                     z_missed = 0;
-                    l_session.main_link.last_rx.store(mono_ms(), Ordering::Relaxed);
-                    l_session.latency_ms.store(l_ping_at.elapsed().as_millis().min(i64::MAX as u128) as i64, Ordering::Relaxed);
-                    // 已打开的终端可继续使用. 只有无终端的连接才因长期无法新开通道而回收.
-                    if l_session.shell.load(Ordering::Acquire) {
-                        z_stale_hits = 0;
-                    } else if z_checked_opens.elapsed() >= z_active_interval {
-                        z_checked_opens = z_probed;
-                        if stale_opens(Arc::as_ptr(&z_handle) as usize, Duration::from_secs(45)) >= 4 {
-                            z_stale_hits += 1;
-                            if z_stale_hits >= 2 {
-                                let _l_tx = l_session.terminal_tx.lock().unwrap_or_else(PoisonError::into_inner);
-                                if !l_session.shell.load(Ordering::Acquire) {
-                                    l_session.main_link.error.lock().unwrap_or_else(PoisonError::into_inner)
-                                        .get_or_insert_with(|| "服务器长时间未答复通道打开请求, 无法再打开终端或执行命令".into());
-                                    kill_socket(&l_session);
-                                }
-                            }
-                        } else {
-                            z_stale_hits = 0;
-                        }
-                    }
-                } else if !z_handle.is_closed() {
-                    z_missed += 1;
+                    l_session.main_link.mark_pong();
+                    l_session.latency_ms.store(l_ping_elapsed.as_millis().min(i64::MAX as u128) as i64, Ordering::Relaxed);
+                    check_stale_opens(&l_session, &z_handle, &z_log_dir, &z_target, &mut z_checked_opens, &mut z_stale_hits);
+                } else if let Some(l_secs) = sleep_gap_secs(l_ping_elapsed, z_last_wall.saturating_sub(l_ping_wall), Duration::from_secs(15)) {
+                    // 休眠发生在探活期间且唤醒后连接可能已断, 在 is_closed 判断之前记录休眠跨度.
+                    l_session.main_link.record_sleep(l_secs);
+                    z_missed = 0;
                     z_stale_hits = 0;
-                    if z_missed >= 2 {
-                        l_session.latency_ms.store(-1, Ordering::Relaxed);
-                    }
-                    let l_last = l_session.main_link.last_rx.load(Ordering::Relaxed);
-                    let l_receiving = l_last > 0 && mono_ms().saturating_sub(l_last) < 60_000;
-                    // 每轮失败约 15 秒超时 + 20 秒间隔 ≈ 35 秒: 无收包 4 轮约 2 分钟, 有收包 6 轮约 3 分钟.
-                    if z_missed >= if l_receiving { 6 } else { 4 } {
-                        l_session.main_link.error.lock().unwrap_or_else(PoisonError::into_inner).get_or_insert_with(|| {
-                            if l_receiving {
-                                "探活超时, 约 3 分钟发出的数据没有得到服务器回应 (连接发送受阻)".into()
-                            } else {
-                                "探活超时, 约 2 分钟没有收到服务器回应 (网络或代理链路中断)".into()
-                            }
-                        });
-                        kill_socket(&l_session);
-                    }
+                } else if !z_handle.is_closed() {
+                    z_stale_hits = 0;
+                    handle_watch_miss(&l_session, &z_log_dir, &z_target, &mut z_missed);
                 }
             }
             // 终端仍开着时由终端读取循环收尾; 它若先看到连接未断而只按终端关闭处理, 下一轮由这里接手, 不能就此退出.
@@ -5203,16 +5567,336 @@ fn watch_connection(c_backend: &Arc<Backend>, c_session: &Arc<LiveSession>, c_ha
     });
 }
 
+// 已打开的终端可继续使用; 只有无终端连接连续两次发现大量卡死通道请求时才回收.
+fn check_stale_opens(
+    c_session: &LiveSession,
+    c_handle: &Arc<client::Handle<SshHandler>>,
+    c_log_dir: &Path,
+    c_target: &str,
+    c_checked_opens: &mut Instant,
+    c_stale_hits: &mut u32,
+) {
+    if c_session.shell.load(Ordering::Acquire) {
+        *c_stale_hits = 0;
+        return;
+    }
+    if c_checked_opens.elapsed() < Duration::from_secs(15) {
+        return;
+    }
+    *c_checked_opens = Instant::now();
+    *c_stale_hits = if stale_opens(Arc::as_ptr(c_handle) as usize, Duration::from_secs(45)) >= 4 {
+        *c_stale_hits + 1
+    } else {
+        0
+    };
+    if *c_stale_hits < 2 {
+        return;
+    }
+    let _z_tx = c_session.terminal_tx.lock().unwrap_or_else(PoisonError::into_inner);
+    if !c_session.shell.load(Ordering::Acquire) {
+        record_link_disconnect(
+            &c_session.main_link,
+            c_log_dir,
+            c_target,
+            false,
+            "服务器长时间未答复通道打开请求, 无法再打开终端或执行命令",
+            "Watchdog(stale_channel_opens)",
+        );
+        kill_socket(c_session);
+    }
+}
+
+fn handle_watch_miss(
+    c_session: &LiveSession,
+    c_log_dir: &Path,
+    c_target: &str,
+    c_missed: &mut u32,
+) {
+    *c_missed += 1;
+    if *c_missed >= 2 {
+        c_session.latency_ms.store(-1, Ordering::Relaxed);
+    }
+    let z_last = c_session.main_link.last_rx_mono();
+    let z_receiving = z_last > 0 && mono_ms().saturating_sub(z_last) < 60_000;
+    // 每轮失败约 15 秒超时 + 20 秒间隔 ≈ 35 秒: 无收包 4 轮约 2 分钟, 有收包 6 轮约 3 分钟.
+    if *c_missed < if z_receiving { 6 } else { 4 } {
+        return;
+    }
+    let z_summary = if z_receiving {
+        "探活超时, 约 3 分钟发出的数据没有得到服务器回应 (连接发送受阻)"
+    } else {
+        "探活超时, 约 2 分钟没有收到服务器回应 (网络或代理链路中断)"
+    };
+    record_link_disconnect(
+        &c_session.main_link,
+        c_log_dir,
+        c_target,
+        false,
+        z_summary,
+        &format!("Watchdog(ping_missed={}, receiving={z_receiving})", *c_missed),
+    );
+    kill_socket(c_session);
+}
+
+// 检测休眠或进程长时间挂起: 墙钟比单调时钟多跨 15 秒 (macOS Instant 停表), 或实际耗时超出预期 25 秒 (Windows QPC 不断表).
+fn sleep_gap_secs(c_mono: Duration, c_wall_ms: u64, c_expected: Duration) -> Option<u64> {
+    let z_wall_drift = c_wall_ms.saturating_sub(c_mono.as_millis() as u64);
+    if z_wall_drift > 15_000 {
+        return Some(z_wall_drift / 1000);
+    }
+    let z_over = c_mono.saturating_sub(c_expected);
+    (z_over > Duration::from_secs(25)).then_some(z_over.as_secs())
+}
+
+fn describe_ssh_error(c_err: &russh::Error) -> (String, String) {
+    match c_err {
+        russh::Error::KeepaliveTimeout => (
+            "保活超时, 长时间未收到服务器任何数据 (网络或代理链路中断)".into(),
+            "KeepaliveTimeout".into(),
+        ),
+        russh::Error::InactivityTimeout => (
+            "无活动超时, 长时间数据未能发出或未收到数据 (网络或代理链路堵塞)".into(),
+            "InactivityTimeout".into(),
+        ),
+        russh::Error::Disconnect => (
+            "连接被关闭, 未收到断开说明 (服务器、代理或网络中断)".into(),
+            "Disconnect".into(),
+        ),
+        russh::Error::IO(l_io) => {
+            let l_detail = safe_error(&l_io.to_string());
+            let l_summary = match l_io.kind() {
+                std::io::ErrorKind::UnexpectedEof => {
+                    if l_detail.is_empty() || l_detail == "early eof" {
+                        "SSH 数据流提前结束, 未收到服务器断开通知".into()
+                    } else {
+                        format!("SSH 数据流提前结束, 未收到服务器断开通知 ({l_detail})")
+                    }
+                }
+                std::io::ErrorKind::ConnectionReset => "连接被对端或代理重置 (Connection reset)".into(),
+                std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::BrokenPipe => "本地网络或代理链路已中断".into(),
+                std::io::ErrorKind::TimedOut => "网络读写超时, 连接已中断".into(),
+                _ => format!("网络错误: {l_detail}"),
+            };
+            (l_summary, format!("IO({:?}: {l_detail})", l_io.kind()))
+        }
+        l_err => {
+            let l_text = safe_error(&l_err.to_string());
+            (format!("网络错误: {l_text}"), l_text)
+        }
+    }
+}
+
+// 汇总断连诊断: 写入首次原因供界面展示与复制, 已认证会话的意外断连同时追加无凭据日志到 disconnect.log.
+fn record_link_disconnect(
+    c_link: &SshLinkState,
+    c_log_dir: &Path,
+    c_target: &str,
+    c_transfer: bool,
+    c_summary: &str,
+    c_raw: &str,
+) {
+    use std::fmt::Write as _;
+
+    // 本端主动断开/取消/认证失败关套接字或已记录过首次原因时直接跳过, 避免污染诊断与重复计算.
+    if c_link.user_closed.load(Ordering::Acquire) || c_link.has_error() {
+        return;
+    }
+    let z_now_mono = mono_ms();
+    let z_now_awake = awake_ms();
+    let z_now_wall = epoch_ms();
+    let z_diag = c_link.diag.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    let z_rx_bytes = c_link.rx_bytes.load(Ordering::Relaxed);
+    let z_tx_bytes = c_link.tx_bytes.load(Ordering::Relaxed);
+    let z_data_mono = c_link.last_data_mono.load(Ordering::Relaxed);
+    let z_pong_mono = c_link.last_pong_mono.load(Ordering::Relaxed);
+    let z_tcp_rx_mono = c_link.last_tcp_rx_mono.load(Ordering::Relaxed);
+    let z_tcp_tx_mono = c_link.last_tcp_tx_mono.load(Ordering::Relaxed);
+    let z_rekeys = c_link.kex_count.load(Ordering::Relaxed).saturating_sub(1);
+
+    let z_fake_ip = !z_diag.via_proxy && (is_fake_ip(z_diag.peer_addr) || is_fake_ip(z_diag.local_addr));
+    let z_route = if z_diag.via_proxy {
+        "经代理"
+    } else if z_fake_ip {
+        "直连 (命中 Fake-IP/TUN)"
+    } else {
+        "直连"
+    };
+
+    let z_authenticated = z_diag.connected_mono != 0;
+    let z_uptime_secs = z_authenticated.then(|| {
+        let l_mono = z_now_mono.saturating_sub(z_diag.connected_mono) / 1000;
+        let l_wall = (z_diag.connected_wall != 0).then(|| z_now_wall.saturating_sub(z_diag.connected_wall) / 1000).unwrap_or(0);
+        l_mono.max(l_wall)
+    });
+
+    // 合并休眠停表时钟 (macOS Instant / Windows QueryUnbiasedInterruptTime) 与 watch_connection 观测到的休眠跨度.
+    let (z_ref_awake, z_ref_wall) = if z_diag.rx_clock_awake != 0 && z_diag.rx_clock_wall != 0 {
+        (z_diag.rx_clock_awake, z_diag.rx_clock_wall)
+    } else {
+        (z_diag.connected_awake, z_diag.connected_wall)
+    };
+    let z_wall_sleep = (z_ref_awake != 0 && z_ref_wall != 0).then(|| {
+        let l_awake_gap = z_now_awake.saturating_sub(z_ref_awake) / 1000;
+        let l_wall_gap = z_now_wall.saturating_sub(z_ref_wall) / 1000;
+        (l_wall_gap > l_awake_gap.saturating_add(15)).then_some(l_wall_gap - l_awake_gap)
+    }).flatten();
+    let z_watch_sleep = (z_diag.sleep_secs > 0 && z_now_mono.saturating_sub(z_diag.sleep_at_mono) <= 300_000)
+        .then_some(z_diag.sleep_secs);
+    let z_sleep_secs = z_wall_sleep.into_iter().chain(z_watch_sleep).max();
+
+    let z_ago = |c_mono: u64| -> Option<u64> {
+        (c_mono != 0).then(|| z_now_mono.saturating_sub(c_mono) / 1000)
+    };
+
+    // 界面展示的精简摘要: 保留核心原因、路径、时长、休眠、收包/探活间隔与重协商次数.
+    let mut z_ui = c_summary.to_owned();
+    let _ = write!(z_ui, " · {z_route}");
+    if let Some(l_secs) = z_uptime_secs {
+        let _ = write!(z_ui, " · 已连接 {}", format_diag_duration(l_secs));
+    }
+    if let Some(l_sleep) = z_sleep_secs {
+        let _ = write!(z_ui, " · 期间疑似系统休眠约 {l_sleep} 秒");
+    }
+    let z_data_ago = z_ago(z_data_mono);
+    let z_pong_ago = z_ago(z_pong_mono);
+    if let Some(l_data) = z_data_ago {
+        let _ = write!(z_ui, " · 业务收包 {l_data} 秒前");
+    }
+    if let Some(l_pong) = z_pong_ago {
+        let _ = write!(z_ui, " · 探活 {l_pong} 秒前");
+    }
+    if z_data_ago.is_none() && z_pong_ago.is_none() && let Some(l_tcp) = z_ago(z_tcp_rx_mono) {
+        let _ = write!(z_ui, " · TCP 收包 {l_tcp} 秒前");
+    }
+    if z_rekeys > 0 {
+        let _ = write!(z_ui, " · 已重协商 {z_rekeys} 次");
+    }
+
+    if !z_authenticated {
+        c_link.set_error_once(z_ui, None);
+        return;
+    }
+
+    // 完整诊断行 (不含密码、密钥、用户名和终端内容), 仅已认证会话用于一键复制与 disconnect.log 落盘.
+    let z_addrs = match (z_diag.local_addr, z_diag.peer_addr) {
+        (Some(l_local), Some(l_peer)) => format!("{l_local} -> {l_peer}"),
+        (_, Some(l_peer)) => format!("-> {l_peer}"),
+        _ => "-".into(),
+    };
+    let z_fmt_ago = |c_mono: u64| z_ago(c_mono).map_or_else(|| "-".into(), |c| format!("{c}s"));
+    let z_detail = format!(
+        "[{}] {} {} | 原因: {} | 原始错误: {} | 路径: {} ({}) | 服务端: {} | 算法: cipher={} kex={} strict_kex={} rekeys={} | 已连接: {} | 流量: rx={} tx={} | 间隔: 业务={} 探活={} tcp收={} tcp发={} | 休眠: {}",
+        format_utc_timestamp(z_now_wall),
+        if c_transfer { "transfer" } else { "main" },
+        safe_error(c_target),
+        c_summary,
+        safe_error(c_raw),
+        z_route,
+        z_addrs,
+        if z_diag.remote_sshid.is_empty() { "-" } else { z_diag.remote_sshid.as_str() },
+        if z_diag.cipher.is_empty() { "-" } else { z_diag.cipher.as_str() },
+        if z_diag.kex.is_empty() { "-" } else { z_diag.kex.as_str() },
+        z_diag.strict_kex,
+        z_rekeys,
+        z_uptime_secs.map_or_else(|| "-".into(), format_diag_duration),
+        format_diag_bytes(z_rx_bytes),
+        format_diag_bytes(z_tx_bytes),
+        z_fmt_ago(z_data_mono),
+        z_fmt_ago(z_pong_mono),
+        z_fmt_ago(z_tcp_rx_mono),
+        z_fmt_ago(z_tcp_tx_mono),
+        z_sleep_secs.map_or_else(|| "无".into(), |c| format!("{c}s")),
+    );
+
+    if c_link.set_error_once(z_ui, Some(z_detail.clone()))
+        && !c_link.user_closed.load(Ordering::Acquire)
+    {
+        append_disconnect_log(c_log_dir.to_path_buf(), z_detail);
+    }
+}
+
+fn append_disconnect_log(c_dir: PathBuf, c_line: String) {
+    static Z_LOG_LOCK: Mutex<()> = Mutex::new(());
+    const MAX_LOG_BYTES: u64 = 256 * 1024;
+    tokio::task::spawn_blocking(move || {
+        let _l_guard = Z_LOG_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let _ = std::fs::create_dir_all(&c_dir);
+        let z_path = c_dir.join("disconnect.log");
+        if std::fs::metadata(&z_path).is_ok_and(|c| c.len() >= MAX_LOG_BYTES) {
+            let l_old = c_dir.join("disconnect.log.old");
+            // 先直接替换 (Windows 下 Rust std 已带 MOVEFILE_REPLACE_EXISTING), 仅失败时再删旧备份重试, 避免源文件被占用时白白丢失 .old.
+            if std::fs::rename(&z_path, &l_old).is_err() {
+                let _ = std::fs::remove_file(&l_old);
+                let _ = std::fs::rename(&z_path, &l_old);
+            }
+        }
+        let mut z_opts = std::fs::OpenOptions::new();
+        z_opts.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            z_opts.mode(0o600);
+        }
+        if let Ok(mut l_file) = z_opts.open(&z_path) {
+            use std::io::Write as _;
+            let _ = writeln!(l_file, "{c_line}");
+        }
+    });
+}
+
+fn is_fake_ip(c_addr: Option<std::net::SocketAddr>) -> bool {
+    matches!(c_addr, Some(std::net::SocketAddr::V4(l_v4)) if {
+        let l_ip = l_v4.ip().octets();
+        l_ip[0] == 198 && (l_ip[1] & 0xfe) == 18
+    })
+}
+
+fn format_diag_duration(c_secs: u64) -> String {
+    if c_secs >= 60 {
+        format!("{} 分 {} 秒", c_secs / 60, c_secs % 60)
+    } else {
+        format!("{c_secs} 秒")
+    }
+}
+
+fn format_diag_bytes(c_bytes: u64) -> String {
+    if c_bytes >= 1024 * 1024 * 1024 {
+        format!("{:.2} GiB", c_bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    } else if c_bytes >= 1024 * 1024 {
+        format!("{:.2} MiB", c_bytes as f64 / (1024.0 * 1024.0))
+    } else if c_bytes >= 1024 {
+        format!("{:.1} KiB", c_bytes as f64 / 1024.0)
+    } else {
+        format!("{c_bytes} B")
+    }
+}
+
+fn format_utc_timestamp(c_epoch_ms: u64) -> String {
+    let z_secs = c_epoch_ms / 1000;
+    let z_days = (z_secs / 86_400) as i64 + 719_468;
+    let z_era = z_days.div_euclid(146_097);
+    let z_doe = z_days.rem_euclid(146_097) as u64;
+    let z_yoe = (z_doe - z_doe / 1460 + z_doe / 36_524 - z_doe / 146_096) / 365;
+    let z_y = z_yoe as i64 + z_era * 400;
+    let z_doy = z_doe - (365 * z_yoe + z_yoe / 4 - z_yoe / 100);
+    let z_mp = (5 * z_doy + 2) / 153;
+    let z_d = z_doy - (153 * z_mp + 2) / 5 + 1;
+    let z_m = if z_mp < 10 { z_mp + 3 } else { z_mp - 9 };
+    let z_year = z_y + i64::from(z_m <= 2);
+    let z_tod = z_secs % 86_400;
+    format!("{z_year:04}-{z_m:02}-{z_d:02}T{:02}:{:02}:{:02}Z", z_tod / 3600, (z_tod % 3600) / 60, z_tod % 60)
+}
+
 // 意外断线的状态: 有断开原因时按错误显示 (状态栏左侧提示并可重试), 否则为已断开.
 // russh 先关闭连接句柄再回调记录原因, 稍等片刻 (最多 1 秒) 以免显示成没有原因的"已断开".
 async fn dropped_status(c_session: &LiveSession) -> String {
     for _ in 0..10 {
-        if c_session.main_link.error.lock().unwrap_or_else(PoisonError::into_inner).is_some() {
+        if c_session.main_link.has_error() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    match c_session.main_link.error.lock().unwrap_or_else(PoisonError::into_inner).as_deref() {
+    match c_session.main_link.error() {
         Some(l_reason) => format!("error: 连接已断开: {l_reason}"),
         None => "disconnected".into(),
     }
@@ -5286,6 +5970,8 @@ fn close_session(c_session: &LiveSession, c_status: &str, c_dropped: bool) {
     if let Ok(mut tx) = c_session.resize_tx.lock() {
         tx.take();
     }
+    c_session.shell_ready.store(false, Ordering::Release);
+    stop_monitor(c_session);
     c_session.browse_sftp.lock().unwrap_or_else(PoisonError::into_inner).take();
     clear_idle_sftp(c_session);
     if let Some(l_task) = c_session.file_details.lock().unwrap_or_else(PoisonError::into_inner).take() {
@@ -5297,6 +5983,8 @@ fn close_session(c_session: &LiveSession, c_status: &str, c_dropped: bool) {
         kill_socket(c_session);
         return;
     }
+    // 用户主动断开、重连或关闭标签: 标记为主动关闭, 避免后续套接字收尾写入意外断连日志.
+    c_session.main_link.mark_user_closed();
     // 传输连接随会话关闭; 正在建立的会由 transfer_handle 发现会话已移除后自行关闭.
     c_session.transfer_auth.lock().unwrap_or_else(PoisonError::into_inner).take();
     c_session.proxy.lock().unwrap_or_else(PoisonError::into_inner).take();
@@ -5307,10 +5995,14 @@ fn close_session(c_session: &LiveSession, c_status: &str, c_dropped: bool) {
         l_socket.1 = true;
         l_socket.0.take()
     };
+    if let Some(l_socket) = &z_socket {
+        l_socket.link.mark_user_closed();
+    }
     let z_handle = c_session.transfer.try_lock().ok().and_then(|mut c| c.0.take());
     if z_handle.is_some() || z_socket.is_some() {
         tokio::spawn(async move {
             if let Some(l_handle) = z_handle {
+                l_handle.state.mark_user_closed();
                 let _ = tokio::time::timeout(Duration::from_secs(2), l_handle.handle.disconnect(Disconnect::ByApplication, "关闭连接", "zh-CN")).await;
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
@@ -5322,8 +6014,10 @@ fn close_session(c_session: &LiveSession, c_status: &str, c_dropped: bool) {
 // 正在用它的任务继续: 探活失败也可能只是上行一时拥塞, 不切断恢复后的传输; 真正卡住的任务每个请求都有超时, 会出错并换新连接重试.
 // 使用者按连接引用计数: 传输任务持有连接, 浏览缓存、空闲池、建目录等 SFTP 会话经通道流持有 (见 SftpStream).
 // 所有使用者释放后关闭 (只剩后台等待通道确认的任务时也算, 它们随连接关闭结束, 见 open_channel); 会话关闭时立即关闭.
-fn retire_transfer(c_session: &Arc<LiveSession>, c_handle: Arc<client::Handle<SshHandler>>) {
-    let z_key = Arc::as_ptr(&c_handle) as usize;
+fn retire_transfer(c_session: &Arc<LiveSession>, c_link: SshLink) {
+    let z_key = c_link.key();
+    let z_handle = c_link.handle;
+    let z_state = c_link.state;
     // 同一把锁内清除当前连接标记并摘除这条连接上的浏览缓存: 之后不会再缓存或放回它上面的会话; 在执行的浏览请求持自己的引用跑完.
     {
         let mut l_suspect = c_session.transfer_suspect.lock().unwrap_or_else(PoisonError::into_inner);
@@ -5341,11 +6035,15 @@ fn retire_transfer(c_session: &Arc<LiveSession>, c_handle: Arc<client::Handle<Ss
             tokio::time::sleep(Duration::from_secs(5)).await;
             // 本任务与每个等待通道确认的后台任务各持有一份引用.
             let l_closed = z_session.upgrade().is_none_or(|c| c.transfer_socket.lock().unwrap_or_else(PoisonError::into_inner).1);
-            if Arc::strong_count(&c_handle) <= 1 + stale_opens(z_key, Duration::ZERO) || c_handle.is_closed() || l_closed {
+            if Arc::strong_count(&z_handle) <= 1 + stale_opens(z_key, Duration::ZERO) || z_handle.is_closed() || l_closed {
                 break;
             }
         }
-        let _ = tokio::time::timeout(Duration::from_secs(2), c_handle.disconnect(Disconnect::ByApplication, "关闭连接", "zh-CN")).await;
+        // 仅在仍存活、准备主动回收时标记 user_closed, 保留已意外断开的真实诊断与日志.
+        if !z_handle.is_closed() {
+            z_state.mark_user_closed();
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(2), z_handle.disconnect(Disconnect::ByApplication, "关闭连接", "zh-CN")).await;
         if let Some(l_socket) = z_socket {
             let _ = l_socket.stream.shutdown(std::net::Shutdown::Both);
         }
@@ -5377,7 +6075,7 @@ fn record_transfer_link(c_task: &Arc<Mutex<Task>>, c_link_used: Option<&mut Opti
 }
 fn transfer_error(c_err: anyhow::Error, c_link: Option<&SshLink>) -> anyhow::Error {
     if let Some(l_link) = c_link
-        && let Some(l_reason) = l_link.state.error.lock().unwrap_or_else(PoisonError::into_inner).as_deref()
+        && let Some(l_reason) = l_link.state.error()
     {
         let l_path = if l_link.dedicated { "独立传输连接" } else { "主 SSH 连接" };
         return c_err.context(format!("{l_path}已断开: {l_reason}"));
@@ -5388,6 +6086,7 @@ fn transfer_error(c_err: anyhow::Error, c_link: Option<&SshLink>) -> anyhow::Err
 struct SshSocket {
     stream: std::net::TcpStream,
     writes: Arc<Mutex<TcpWriteStats>>,
+    link: Arc<SshLinkState>,
 }
 fn upload_socket_writes(
     c_session: &LiveSession,
@@ -5402,7 +6101,7 @@ fn upload_socket_writes(
     }
     c_session.socket.lock().unwrap_or_else(PoisonError::into_inner).as_ref().map(|c| c.writes.clone())
 }
-// 待发布的套接字副本: 被丢弃 (调用方取消、建立失败、未能发布) 时关闭, russh 留在后台的握手或会话任务随之结束;
+// 待发布的套接字副本: 被丢弃 (调用方取消、建立失败、未能发布) 时标记主动关闭并终止套接字;
 // 发布成功时用 take 转移所有权.
 struct SocketGuard(Mutex<Option<SshSocket>>);
 impl SocketGuard {
@@ -5413,6 +6112,7 @@ impl SocketGuard {
 impl Drop for SocketGuard {
     fn drop(&mut self) {
         if let Some(l_socket) = self.take() {
+            l_socket.link.mark_user_closed();
             let _ = l_socket.stream.shutdown(std::net::Shutdown::Both);
         }
     }
@@ -5479,7 +6179,7 @@ fn publish_command_output(
 }
 fn task_summary(c_task: &Task) -> Value {
     let z_stdout_bytes = c_task.stdout.len() + c_task.transfer_diagnostics.as_ref().map_or(0, |(_, l_report)| l_report.len() + usize::from(!c_task.stdout.is_empty()));
-    json!({"task_id":c_task.task_id,"session_id":c_task.session_id,"connection_id":c_task.connection.id,"created_at_ms":c_task.created_at_ms,"source":c_task.source,"client":c_task.client,"kind":c_task.kind,"label":c_task.label,"local":c_task.local,"started_at_ms":c_task.started_at_ms,"finished_at_ms":c_task.finished_at_ms,"status":task_status(c_task),"bytes":c_task.bytes,"total":c_task.total,"speed_bytes_per_sec":current_speed(c_task),"main_link":c_task.via_main_link,"stdout_bytes":z_stdout_bytes,"stderr_bytes":c_task.stderr.len(),"truncated":c_task.truncated,"exit_code":c_task.exit_code,"error":c_task.error})
+    json!({"task_id":c_task.task_id,"session_id":c_task.session_id,"connection_id":c_task.connection.id,"created_at_ms":c_task.created_at_ms,"source":c_task.source,"client":c_task.client,"kind":c_task.kind,"label":c_task.label,"local":c_task.local,"started_at_ms":c_task.started_at_ms,"finished_at_ms":c_task.finished_at_ms,"status":task_status(c_task),"bytes":c_task.bytes,"total":c_task.total,"speed_bytes_per_sec":current_speed(c_task),"directory":c_task.directory,"files_done":c_task.files_done,"files_failed":c_task.files_failed,"files_total":c_task.files_total,"file_bytes":c_task.file_bytes,"file_total":c_task.file_total,"main_link":c_task.via_main_link,"stdout_bytes":z_stdout_bytes,"stderr_bytes":c_task.stderr.len(),"truncated":c_task.truncated,"exit_code":c_task.exit_code,"error":c_task.error})
 }
 
 fn task_status(c_task: &Task) -> &str {
@@ -5554,6 +6254,26 @@ fn mono_ms() -> u64 {
     START.elapsed().as_millis() as u64 + 1
 }
 
+// 休眠停表时钟毫秒: macOS 上 Instant 休眠停表; Windows 上 Instant (QPC) 不断表, 改用 QueryUnbiasedInterruptTime.
+#[cfg(windows)]
+fn awake_ms() -> u64 {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn QueryUnbiasedInterruptTime(c_time: *mut u64) -> i32;
+    }
+    let mut z_ticks = 0u64;
+    if unsafe { QueryUnbiasedInterruptTime(&raw mut z_ticks) } != 0 {
+        z_ticks / 10_000 + 1
+    } else {
+        mono_ms()
+    }
+}
+
+#[cfg(not(windows))]
+fn awake_ms() -> u64 {
+    mono_ms()
+}
+
 fn actor_name(c_actor: Actor) -> &'static str {
     match c_actor {
         Actor::User => "user",
@@ -5609,19 +6329,20 @@ fn ansi_rgb(c_index: u8) -> (u8, u8, u8) {
         (v, v, v)
     }
 }
-// 按实测速率限制在途请求数: 高速线路很快放开到上限, 极慢线路控制在 c_queue_seconds 秒排队量内, 避免后排请求假超时.
+// 按实测速率限制在途请求数: 高速线路很快放开到上限, 极慢或骤降线路优先按近 2 秒速率控制在 c_queue_seconds 秒排队量内, 避免后排请求假超时.
 fn transfer_target_window(
     c_window: usize,
     c_max_window: usize,
     c_done_bytes: u64,
     c_elapsed: Duration,
+    c_recent_rate: Option<f64>,
     c_chunk_size: usize,
     c_queue_seconds: f64,
 ) -> usize {
     if c_done_bytes < 256 * 1024 || c_elapsed < Duration::from_millis(500) {
         return c_window.min(c_max_window);
     }
-    let z_rate = c_done_bytes as f64 / c_elapsed.as_secs_f64();
+    let z_rate = c_recent_rate.unwrap_or_else(|| c_done_bytes as f64 / c_elapsed.as_secs_f64());
     let z_cap = (z_rate * c_queue_seconds / c_chunk_size.max(1) as f64) as usize;
     c_window.min(z_cap.clamp(4, c_max_window))
 }
@@ -5648,7 +6369,10 @@ async fn read_remote_exact(
             .map_err(|err| anyhow::Error::new(err).context("读取远端文件超时"))?;
         match l_reply {
             Ok(l_data) if l_data.data.is_empty() => break,
-            Ok(l_data) => z_out.extend_from_slice(&l_data.data),
+            Ok(l_data) => {
+                ensure!(l_data.data.len() <= l_want as usize, "服务器返回的数据块长度超出请求范围");
+                z_out.extend_from_slice(&l_data.data);
+            }
             Err(SftpError::Status(l_status)) if l_status.status_code == StatusCode::Eof => break,
             Err(err) => return Err(anyhow::Error::from(err).context("读取远端文件失败")),
         }
@@ -5702,13 +6426,15 @@ async fn commit_upload(
     // 提交结果无法确认时保留临时文件 (里面是新数据), 失败处理不删除.
     let mut z_keep_part = false;
     let z_result = async {
-        // 覆盖时沿用旧文件权限 (如可执行位、0600), 新建的临时文件默认受服务器 umask 影响.
+        // 覆盖时尽量沿用旧文件普通权限位 (0777, 避开 SUID/SGID); 不支持 SETSTAT 或受限文件系统明确拒绝时不中止整次提交.
         if let Some(l_permissions) = c_permissions {
-            let l_attrs = FileAttributes { permissions: Some(l_permissions & 0o7777), ..FileAttributes::default() };
-            tokio::time::timeout(Duration::from_secs(60), c_raw.setstat(c_part.clone(), l_attrs))
+            let l_attrs = FileAttributes { permissions: Some(l_permissions & 0o0777), ..FileAttributes::default() };
+            let l_set = tokio::time::timeout(Duration::from_secs(60), c_raw.setstat(c_part.clone(), l_attrs))
                 .await
-                .context("设置远端文件权限超时")?
-                .context("设置远端文件权限失败")?;
+                .context("设置远端文件权限超时")?;
+            if let Err(err) = l_set && !sftp_definite(&err) {
+                return Err(anyhow::Error::from(err).context("设置远端文件权限失败"));
+            }
         }
         let z_rename = async |c_from: String, c_to: String| {
             tokio::time::timeout(Duration::from_secs(60), c_raw.rename(c_from, c_to))
@@ -5719,10 +6445,10 @@ async fn commit_upload(
         };
         if c_overwrite && c_exists && !c_posix_rename {
             // 不支持原子替换: 旧文件先改为备份名, 新文件就位后删除备份; 失败时恢复旧文件.
-            // 改名超时或回包丢失时结果未知, 按实际文件状态判断: Some(是否存在), 查不到为 None.
+            // 改名超时或回包丢失时结果未知, 按实际文件状态判断 (用 lstat 识别悬空符号链接): Some(是否存在), 查不到为 None.
             let l_backup = format!("{c_part}.old");
             let z_present = async |c_path: String| {
-                match tokio::time::timeout(Duration::from_secs(30), c_raw.stat(c_path)).await {
+                match tokio::time::timeout(Duration::from_secs(30), c_raw.lstat(c_path)).await {
                     Ok(Ok(_)) => Some(true),
                     Ok(Err(SftpError::Status(l_status))) if l_status.status_code == StatusCode::NoSuchFile => Some(false),
                     _ => None,
@@ -5839,12 +6565,13 @@ fn resume_offset(c_resume: &mut (u64, Option<(u64, u64)>), c_owned: bool, c_size
 }
 // 遍历本机文件夹, 返回待建的远端目录 (根在最前)、文件列表 (本机路径, 远端路径, 大小) 与跳过项说明.
 fn scan_local_directory(c_local: &Path, c_remote: &str, c_task: &Mutex<Task>) -> Result<(Vec<String>, Vec<(PathBuf, String, u64)>, String)> {
+    const MAX_DIRECTORY_DEPTH: usize = 64;
     let z_cancelled = || c_task.lock().unwrap_or_else(PoisonError::into_inner).cancel.is_none();
     let mut z_dirs = vec![c_remote.to_owned()];
     let mut z_files = Vec::new();
     let mut z_notes = String::new();
-    let mut z_pending = vec![(c_local.to_path_buf(), c_remote.to_owned())];
-    while let Some((l_local, l_remote)) = z_pending.pop() {
+    let mut z_pending = vec![(c_local.to_path_buf(), c_remote.to_owned(), 0usize)];
+    while let Some((l_local, l_remote, l_depth)) = z_pending.pop() {
         ensure!(!z_cancelled(), "任务已取消");
         let l_entries = match std::fs::read_dir(&l_local) {
             Ok(c) => c,
@@ -5881,8 +6608,12 @@ fn scan_local_directory(c_local: &Path, c_remote: &str, c_task: &Mutex<Task>) ->
             };
             ensure!(z_files.len() + z_dirs.len() < MAX_DIRECTORY_ITEMS, "文件夹超过 {MAX_DIRECTORY_ITEMS} 项, 请分批传输");
             if l_metadata.is_dir() {
+                if l_depth >= MAX_DIRECTORY_DEPTH {
+                    directory_note(&mut z_notes, format!("跳过 {}: 目录层级超过 {MAX_DIRECTORY_DEPTH} 层", l_path.display()));
+                    continue;
+                }
                 z_dirs.push(l_target.clone());
-                z_pending.push((l_path, l_target));
+                z_pending.push((l_path, l_target, l_depth + 1));
             } else if l_metadata.is_file() {
                 z_files.push((l_path, l_target, l_metadata.len()));
             } else {
@@ -5907,8 +6638,8 @@ async fn create_local_transfer_dir(c_path: &Path, c_reuse: bool) -> Result<()> {
     }
 }
 
-// 读出远端目录的全部条目; 打开失败原样返回, 由调用方区分权限问题和连接问题.
-async fn read_remote_directory(c_raw: &russh_sftp::client::RawSftpSession, c_path: &str) -> Result<Vec<russh_sftp::protocol::File>> {
+// 读出远端目录的全部条目, 并返回目录句柄是否已确认关闭; 打开失败原样返回, 由调用方区分权限问题和连接问题.
+async fn read_remote_directory(c_raw: &russh_sftp::client::RawSftpSession, c_path: &str) -> Result<(Vec<russh_sftp::protocol::File>, bool)> {
     let z_handle = tokio::time::timeout(Duration::from_secs(15), c_raw.opendir(c_path.to_owned()))
         .await
         .context("打开远端目录超时")??
@@ -5919,8 +6650,8 @@ async fn read_remote_directory(c_raw: &russh_sftp::client::RawSftpSession, c_pat
         z_entries.extend(c_files);
         Ok(false)
     }).await;
-    let _ = tokio::time::timeout(Duration::from_secs(10), c_raw.close(z_handle)).await;
-    z_result.map(|_| z_entries)
+    let z_closed = matches!(tokio::time::timeout(Duration::from_secs(10), c_raw.close(z_handle)).await, Ok(Ok(_)));
+    z_result.map(|_| (z_entries, z_closed))
 }
 // 记录文件夹任务的跳过或失败项, 超出保留条数后只提示一次.
 fn directory_note(c_notes: &mut String, c_text: String) {
@@ -5946,12 +6677,65 @@ pub(crate) fn local_file_name(c_name: &str) -> String {
     if z_trimmed.is_empty() {
         return "_".into();
     }
-    // 设备保留名 (CON、NUL、COM1 等, 带扩展名也算) 会写到设备而不是文件, 加前缀避开.
-    let z_stem = z_trimmed.split('.').next().unwrap_or_default().to_ascii_uppercase();
+    // 设备保留名 (CON、NUL、COM1 等, 带扩展名或点前尾随空格如 "CON .txt" 也算) 会写到设备而不是文件, 加前缀避开.
+    let z_stem = z_trimmed.split('.').next().unwrap_or_default().trim_end_matches(' ').to_ascii_uppercase();
     // 上标 ¹²³ 也算 (COM¹、LPT² 等).
     let z_reserved = matches!(z_stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
         || matches!(z_stem.strip_prefix("COM").or_else(|| z_stem.strip_prefix("LPT")), Some("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"));
     if z_reserved { format!("_{z_trimmed}") } else { z_trimmed.to_owned() }
+}
+// 判断本机路径是否位于 c_dir 之内 (用于隔离 MCP 访问 HiPShell 配置目录).
+// 先尝试整路径 canonicalize; 若目标尚未创建则逐分量推进, 已存在前缀先 canonicalize 再处理后续 .. (避免先词法折叠绕过符号链接),
+// 并兼容 Windows \\?\UNC\ 与 \\?\ 前缀以及 macOS/Windows 大小写不敏感比较.
+fn path_in_dir(c_path: &Path, c_dir: &Path) -> bool {
+    let z_strip_verbatim = |c_p: PathBuf| -> PathBuf {
+        #[cfg(windows)]
+        if let Some(l_s) = c_p.to_str() {
+            if let Some(l_unc) = l_s.strip_prefix(r"\\?\UNC\") {
+                return PathBuf::from(format!(r"\\{l_unc}"));
+            }
+            if let Some(l_rest) = l_s.strip_prefix(r"\\?\") {
+                return PathBuf::from(l_rest);
+            }
+        }
+        c_p
+    };
+    let z_normalize = |c_input: &Path| -> PathBuf {
+        if let Ok(l_canon) = c_input.canonicalize() {
+            return z_strip_verbatim(l_canon);
+        }
+        let mut l_out = PathBuf::new();
+        for l_comp in c_input.components() {
+            match l_comp {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    if let Ok(l_canon) = l_out.canonicalize() {
+                        l_out = z_strip_verbatim(l_canon);
+                    }
+                    l_out.pop();
+                }
+                l_other => {
+                    l_out.push(l_other.as_os_str());
+                    if let Ok(l_canon) = l_out.canonicalize() {
+                        l_out = z_strip_verbatim(l_canon);
+                    }
+                }
+            }
+        }
+        z_strip_verbatim(l_out)
+    };
+    let z_target = z_normalize(c_path);
+    let z_root = z_normalize(c_dir);
+    let mut z_t_iter = z_target.components();
+    for l_r in z_root.components() {
+        let Some(l_t) = z_t_iter.next() else {
+            return false;
+        };
+        if local_name_key(&l_r.as_os_str().to_string_lossy()) != local_name_key(&l_t.as_os_str().to_string_lossy()) {
+            return false;
+        }
+    }
+    true
 }
 // 本机同名比较键: Windows 与 macOS 默认文件系统不区分大小写, Readme 与 README 指向同一文件, 按小写比较;
 // macOS 还把 é 的组合与分解两种编码视为同名, 先统一为分解形式.
@@ -6222,7 +7006,7 @@ impl SftpStream {
                     _ = z_queue.closed() => break,
                 };
                 match l_message {
-                    Some(ChannelMsg::Data { data }) => {
+                    Some(ChannelMsg::Data { data }) if !data.is_empty() => {
                         if !matches!(tokio::time::timeout(Duration::from_secs(15), z_queue.send(data)).await, Ok(Ok(()))) {
                             break;
                         }
@@ -6252,7 +7036,7 @@ impl SftpStream {
 }
 impl tokio::io::AsyncRead for SftpStream {
     fn poll_read(mut self: std::pin::Pin<&mut Self>, c_cx: &mut std::task::Context<'_>, c_buf: &mut tokio::io::ReadBuf<'_>) -> std::task::Poll<std::io::Result<()>> {
-        if self.pending.is_empty() {
+        while self.pending.is_empty() {
             match self.rx.poll_recv(c_cx) {
                 std::task::Poll::Ready(Some(l_data)) => self.pending = l_data,
                 // 队列结束即通道结束, 不填数据表示 EOF.
@@ -6345,7 +7129,7 @@ async fn take_idle_sftp(c_session: &Arc<LiveSession>) -> Option<(SshLink, Arc<At
         if z_link.transfer_idle() && !z_link.probe_transfer().await {
             drop(z_sftp);
             l_slot.0 = None;
-            retire_transfer(c_session, z_link.handle);
+            retire_transfer(c_session, z_link);
             return None;
         }
     }
@@ -6566,18 +7350,22 @@ async fn ssh_connect(c_conn: &Connection, c_proxy: Option<&ProxyRoute>, c_handle
     let z_std = z_stream.into_std().context("读取连接套接字失败")?;
     configure_tcp_keepalive(&z_std);
     let z_writes = Arc::new(Mutex::new(TcpWriteStats::default()));
+    let z_link = c_handler.link.clone();
     *c_socket.lock().unwrap_or_else(PoisonError::into_inner) = Some(SshSocket {
         stream: z_std.try_clone().context("复制连接套接字失败")?,
         writes: z_writes.clone(),
+        link: z_link.clone(),
     });
+    let z_local = z_std.local_addr().ok();
+    let z_peer = z_std.peer_addr().ok();
     let z_stream = tokio::net::TcpStream::from_std(z_std).context("读取连接套接字失败")?;
-    c_handler.link.connected_at.store(mono_ms(), Ordering::Relaxed);
+    z_link.mark_route(c_proxy.is_some(), z_local, z_peer);
     let z_config = ssh_config(c_handler.transfer);
     // 收紧用户态写缓冲 (独立连接 512 KiB, 主连接 256 KiB): 既解耦 russh 收发避免阻塞读取确认,
     // 又保留真实 TCP 背压, 防止多 MiB 密文积压拖慢控制包、保活回复和同连接下载.
     let z_write_buffer = if c_handler.transfer { 512 * 1024 } else { 256 * 1024 };
     let (z_read, z_write) = z_stream.into_split();
-    Ok(client::connect_stream(z_config, buffer_ssh_writes(z_read, z_write, z_write_buffer, z_writes), c_handler).await?)
+    Ok(client::connect_stream(z_config, buffer_ssh_writes(z_read, z_write, z_write_buffer, z_writes, z_link), c_handler).await?)
 }
 
 // 同一连接所有出站字节, 含 SSH 协议开销和其他通道. write 成功只表示 TCP 接收了数据.
@@ -6595,21 +7383,22 @@ impl TcpWriteStats {
 
 // russh 要等加密后的整批数据写入套接字, 才继续读服务器的确认和窗口更新.
 // 用有界缓冲把 TCP 写入交给单独任务, 慢上行时收到的确认也能及时处理.
-fn buffer_ssh_writes<R, W>(
-    c_read: R,
-    mut c_write: W,
+fn buffer_ssh_writes(
+    c_read: tokio::net::tcp::OwnedReadHalf,
+    mut c_write: tokio::net::tcp::OwnedWriteHalf,
     c_buffer_bytes: usize,
     c_stats: Arc<Mutex<TcpWriteStats>>,
-) -> impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static
-where
-    R: tokio::io::AsyncRead + Send + Unpin + 'static,
-    W: tokio::io::AsyncWrite + Send + Unpin + 'static,
-{
+    c_link: Arc<SshLinkState>,
+) -> impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static {
     use std::io;
     use tokio::io::AsyncBufReadExt;
 
     let (z_writer, z_reader) = tokio::io::duplex(c_buffer_bytes);
-    let (z_failure_tx, z_failure_rx) = oneshot::channel();
+    let (z_wake_tx, z_wake_rx) = oneshot::channel();
+    // 读写两端共享真实写错误: 缓冲满时 russh 阻塞在写端, 避免 DuplexStream 关闭后只看到泛型 BrokenPipe.
+    let z_write_error: Arc<Mutex<Option<io::Error>>> = Arc::new(Mutex::new(None));
+    let z_task_error = z_write_error.clone();
+    let z_write_link = c_link.clone();
     tokio::spawn(async move {
         let mut z_reader = tokio::io::BufReader::with_capacity(64 * 1024, z_reader);
         let z_result = async {
@@ -6618,7 +7407,7 @@ where
                 if l_data.is_empty() {
                     return c_write.shutdown().await;
                 }
-                // 按实际写入进展计时, 与独立连接的无活动超时一致. 写入中断时唤醒 SSH 读取端.
+                // 按实际写入进展计时, 与独立连接的无活动超时一致. 写入中断时唤醒 SSH 读写端.
                 let l_started = Instant::now();
                 c_stats.lock().unwrap_or_else(PoisonError::into_inner).pending_since = Some(l_started);
                 let l_written = tokio::time::timeout(SSH_IO_TIMEOUT, c_write.write(l_data)).await;
@@ -6626,6 +7415,9 @@ where
                     let mut l_stats = c_stats.lock().unwrap_or_else(PoisonError::into_inner);
                     if let Ok(Ok(l_count)) = l_written {
                         l_stats.bytes += l_count as u64;
+                        if l_count > 0 {
+                            z_write_link.mark_tcp_tx(l_count);
+                        }
                     }
                     l_stats.elapsed += l_started.elapsed();
                     l_stats.pending_since = None;
@@ -6639,40 +7431,104 @@ where
             }
         }.await;
         if let Err(err) = z_result {
-            let _ = z_failure_tx.send(err);
+            *z_task_error.lock().unwrap_or_else(PoisonError::into_inner) = Some(err);
+            let _ = z_wake_tx.send(());
             let _ = c_write.shutdown().await;
         }
     });
-    tokio::io::join(SshSocketReader { inner: c_read, write_error: z_failure_rx }, z_writer)
+    tokio::io::join(
+        SshSocketReader { inner: c_read, write_wake: z_wake_rx, write_error: z_write_error.clone(), link: c_link },
+        SshSocketWriter { inner: z_writer, write_error: z_write_error },
+    )
 }
 
-struct SshSocketReader<R> {
-    inner: R,
-    write_error: oneshot::Receiver<std::io::Error>,
+fn take_write_error(c_slot: &Mutex<Option<std::io::Error>>) -> Option<std::io::Error> {
+    c_slot.lock().unwrap_or_else(PoisonError::into_inner).take()
 }
 
-impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for SshSocketReader<R> {
+struct SshSocketReader {
+    inner: tokio::net::tcp::OwnedReadHalf,
+    write_wake: oneshot::Receiver<()>,
+    write_error: Arc<Mutex<Option<std::io::Error>>>,
+    link: Arc<SshLinkState>,
+}
+
+impl tokio::io::AsyncRead for SshSocketReader {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
         c_cx: &mut std::task::Context<'_>,
         c_buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        if !self.write_error.is_terminated()
-            && let std::task::Poll::Ready(Ok(err)) = std::pin::Pin::new(&mut self.write_error).poll(c_cx)
+        if !self.write_wake.is_terminated()
+            && let std::task::Poll::Ready(Ok(())) = std::pin::Pin::new(&mut self.write_wake).poll(c_cx)
+            && let Some(err) = take_write_error(&self.write_error)
         {
             return std::task::Poll::Ready(Err(err));
         }
+        let z_want = c_buf.remaining();
         let z_before = c_buf.filled().len();
         let z_read = std::pin::Pin::new(&mut self.inner).poll_read(c_cx, c_buf);
-        // 读端返回 0 字节 EOF 时再查一次写任务错误: 避免 BrokenPipe / ConnectionReset / 写超时被掩盖为 UnexpectedEof.
-        if matches!(z_read, std::task::Poll::Ready(Ok(())))
-            && c_buf.filled().len() == z_before
-            && !self.write_error.is_terminated()
-            && let Ok(err) = self.write_error.try_recv()
-        {
-            return std::task::Poll::Ready(Err(err));
+        if let std::task::Poll::Ready(Ok(())) = &z_read {
+            let l_got = c_buf.filled().len().saturating_sub(z_before);
+            if l_got > 0 {
+                self.link.mark_tcp_rx(l_got);
+            } else if z_want > 0 {
+                // 0 字节 EOF: 先核对写任务错误和内核 SO_ERROR, 避免真实网络错误被掩盖为 UnexpectedEof.
+                if let Some(err) = take_write_error(&self.write_error) {
+                    return std::task::Poll::Ready(Err(err));
+                }
+                if let Ok(Some(err)) = self.inner.as_ref().take_error() {
+                    return std::task::Poll::Ready(Err(err));
+                }
+            }
         }
         z_read
+    }
+}
+
+struct SshSocketWriter {
+    inner: tokio::io::DuplexStream,
+    write_error: Arc<Mutex<Option<std::io::Error>>>,
+}
+
+impl SshSocketWriter {
+    fn map_err(&self, c_err: std::io::Error) -> std::io::Error {
+        if c_err.kind() == std::io::ErrorKind::BrokenPipe
+            && let Some(l_err) = take_write_error(&self.write_error)
+        {
+            return l_err;
+        }
+        c_err
+    }
+}
+
+impl tokio::io::AsyncWrite for SshSocketWriter {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        c_cx: &mut std::task::Context<'_>,
+        c_buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner)
+            .poll_write(c_cx, c_buf)
+            .map_err(|err| self.map_err(err))
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        c_cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner)
+            .poll_flush(c_cx)
+            .map_err(|err| self.map_err(err))
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        c_cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner)
+            .poll_shutdown(c_cx)
+            .map_err(|err| self.map_err(err))
     }
 }
 
@@ -6952,6 +7808,8 @@ fn mark_task(c_task: &Arc<Mutex<Task>>, c_status: &str, c_error: Option<String>)
                 t.last_transfer_error = t.error.clone();
             }
         } else if matches!(c_status, "completed" | "failed" | "cancelled") {
+            t.speed_bytes_per_sec = 0;
+            t.speed_samples.clear();
             t.finished_at_ms = Some(epoch_ms());
         }
     }
@@ -7448,31 +8306,37 @@ fn format_unix_permissions(c_mode: u32) -> String {
 // 监控使用一条常驻通道: 远端脚本每秒输出一次 CPU、内存与网络, 每 3 次附带进程列表 (读取全部 /proc/*/stat 开销较大),
 // 不必每次新开通道. 速率按服务器 /proc/uptime 计算, 不受网络延迟抖动影响. 通道中断后 3 秒重连, 连续失败时逐次放慢.
 // 偶发中断自动重连且保留上次数据, 不提示; 连续约 15 秒取不到数据才显示"监控暂不可用".
-async fn monitor_loop(c_session: Weak<LiveSession>) {
+async fn monitor_loop(c_session: Weak<LiveSession>, mut c_stop: oneshot::Receiver<()>) {
     let mut z_failed_since: Option<Instant> = None;
     // 连续快速结束的次数 (运行超过 15 秒才结束的不算).
     let mut z_streak = 0u32;
     let z_online = |c: &LiveSession| {
         c.status.lock().is_ok_and(|s| s.as_str() == "connected")
+            && c.shell_ready.load(Ordering::Acquire)
             && c.handle.lock().unwrap_or_else(PoisonError::into_inner).as_ref().is_some_and(|l| !l.is_closed())
     };
     loop {
+        if !matches!(c_stop.try_recv(), Err(oneshot::error::TryRecvError::Empty)) {
+            return;
+        }
         let Some(l_session) = c_session.upgrade() else { return; };
         if !z_online(&l_session) {
             return;
         }
         let z_started = Instant::now();
         let mut z_sampled = false;
-        let z_result = monitor_stream(&l_session, &mut z_sampled).await;
+        let z_result = monitor_stream(&l_session, &mut z_sampled, &mut c_stop).await;
         if !z_online(&l_session) {
             return;
         }
         match z_result {
-            Ok(false) => {
+            Ok(None) => return,
+            Ok(Some(false)) => {
+                l_session.monitor_unsupported.store(true, Ordering::Release);
                 apply_monitor_error(&l_session, &anyhow::anyhow!("服务器不支持 /proc 系统监控"));
                 return;
             }
-            Ok(true) => {}
+            Ok(Some(true)) => {}
             Err(err) => {
                 let l_now = Instant::now();
                 // 确实收到过采样且稳定运行超过 15 秒后才中断的, 以当前时刻作为新一轮失败起点.
@@ -7487,9 +8351,13 @@ async fn monitor_loop(c_session: Weak<LiveSession>) {
             }
         }
         drop(l_session);
-        // 连续很快失败时逐次加长间隔到 60 秒, 不每 3 秒新开一次命令.
+        // 连续很快失败时逐次加长间隔到 60 秒, 不每 3 秒新开一次命令; 收到停止信号时立即退出.
         z_streak = z_streak.saturating_add(1);
-        tokio::time::sleep(Duration::from_secs((3u64 << z_streak.saturating_sub(1).min(5)).min(60))).await;
+        tokio::select! {
+            biased;
+            _ = &mut c_stop => return,
+            _ = tokio::time::sleep(Duration::from_secs((3u64 << z_streak.saturating_sub(1).min(5)).min(60))) => {}
+        }
     }
 }
 
@@ -7497,14 +8365,23 @@ async fn monitor_loop(c_session: Weak<LiveSession>) {
 // 启动先检查 /proc 可读性 (不支持时返回 42 停止重试); 输出末尾检测写管道失败以便通道关闭后远端进程立即退出.
 const MONITOR_SCRIPT: &str = "exec 2>/dev/null; [ -r /proc/stat ] && [ -r /proc/meminfo ] || exit 42; i=0; while :; do if [ $((i % 3)) -eq 0 ]; then count=0; truncated=0; printf 'HIPSSH_PROC_BEGIN\\n'; for f in /proc/[0-9]*/stat; do [ -r \"$f\" ] || continue; if [ \"$count\" -ge 512 ]; then truncated=1; break; fi; line=; while IFS= read -r part || [ -n \"$part\" ]; do line=\"$line$part\"; done < \"$f\"; printf 'P\\t%s\\n' \"$line\"; count=$((count+1)); done; printf 'HIPSSH_PROC_END\\t%s\\n' \"$truncated\"; printf 'HIPSSH_PAGE_SIZE\\t%s\\n' \"$(getconf PAGESIZE 2>/dev/null)\"; printf 'HIPSSH_CLK_TCK\\t%s\\n' \"$(getconf CLK_TCK 2>/dev/null)\"; fi; read up rest < /proc/uptime; printf 'HIPSSH_UPTIME\\t%s\\n' \"$up\"; cat /proc/stat /proc/meminfo; printf 'HIPSSH_NET_BEGIN\\n'; cat /proc/net/dev; printf 'HIPSSH_NET_END\\nHIPSSH_SAMPLE_END\\n' || exit 0; i=$((i+1)); sleep 1; done";
 
-async fn monitor_stream(c_session: &Arc<LiveSession>, c_sampled: &mut bool) -> Result<bool> {
+async fn monitor_stream(c_session: &Arc<LiveSession>, c_sampled: &mut bool, c_stop: &mut oneshot::Receiver<()>) -> Result<Option<bool>> {
     const SAMPLE_END: &[u8] = b"HIPSSH_SAMPLE_END\n";
     let z_handle = c_session.ssh_handle()?;
-    // 守卫保证通道在出错、卡住或会话结束时关闭, 不占用服务器会话名额.
-    let mut channel = ClosingChannel(Some(open_channel(&z_handle, 15).await.context("打开监控通道超时")?));
-    tokio::time::timeout(Duration::from_secs(10), channel.exec(true, MONITOR_SCRIPT))
-        .await
-        .context("启动远端监控命令超时")??;
+    // 守卫保证通道在出错、卡住、停止或会话结束时关闭, 不占用服务器会话名额.
+    let z_opened = tokio::select! {
+        biased;
+        _ = &mut *c_stop => return Ok(None),
+        l_res = open_channel(&z_handle, 15) => l_res.context("打开监控通道超时")?,
+    };
+    let mut channel = ClosingChannel(Some(z_opened));
+    tokio::select! {
+        biased;
+        _ = &mut *c_stop => return Ok(None),
+        l_res = tokio::time::timeout(Duration::from_secs(10), channel.exec(true, MONITOR_SCRIPT)) => {
+            l_res.context("启动远端监控命令超时")??;
+        }
+    }
     let mut z_previous: Option<ProcSample> = None;
     let mut z_previous_proc: Option<ProcSample> = None;
     let mut z_buffer = Vec::with_capacity(64 * 1024);
@@ -7515,9 +8392,13 @@ async fn monitor_stream(c_session: &Arc<LiveSession>, c_sampled: &mut bool) -> R
         // 每轮先检查绝对期限: 剩余时间为 0 时 timeout 仍会先轮询一次读取, 消息不断时会一直越过期限.
         // 跨国代理抖动或远端遍历 512 进程耗时较长时留足 25 秒, 避免短暂抖动反复重启监控通道.
         ensure!(z_last_sample.elapsed() < Duration::from_secs(25), "远端监控无响应");
-        let z_message = tokio::time::timeout(Duration::from_secs(25).saturating_sub(z_last_sample.elapsed()), channel.wait())
-            .await
-            .context("远端监控无响应")?;
+        let z_message = tokio::select! {
+            biased;
+            _ = &mut *c_stop => return Ok(None),
+            l_res = tokio::time::timeout(Duration::from_secs(25).saturating_sub(z_last_sample.elapsed()), channel.wait()) => {
+                l_res.context("远端监控无响应")?
+            }
+        };
         match z_message {
             Some(ChannelMsg::Data { data }) => {
                 z_buffer.extend_from_slice(&data);
@@ -7539,7 +8420,7 @@ async fn monitor_stream(c_session: &Arc<LiveSession>, c_sampled: &mut bool) -> R
             Some(ChannelMsg::Eof) => {}
             Some(ChannelMsg::Close) | None => {
                 if z_exit_code == Some(42) {
-                    return Ok(false);
+                    return Ok(Some(false));
                 }
                 bail!("远端监控已结束");
             }

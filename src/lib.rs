@@ -2,6 +2,7 @@ pub mod backend;
 pub mod commands;
 pub mod config;
 pub mod finalshell;
+pub mod i18n;
 pub mod mcp;
 pub mod model;
 #[cfg(feature = "desktop")]

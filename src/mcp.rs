@@ -1,11 +1,16 @@
 use std::{
     collections::HashMap,
     future::Future,
-    sync::{Arc, LazyLock, Mutex, PoisonError},
-    time::{Duration, Instant},
+    path::{Path, PathBuf},
+    sync::{
+        Arc, LazyLock, Mutex, PoisonError,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, ensure};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -18,15 +23,22 @@ use crate::{backend::Backend, model::Actor};
 pub const DEFAULT_PORT: u16 = 7391;
 const MAX_HTTP_HEADER: usize = 16 * 1024;
 const MAX_HTTP_SESSIONS: usize = 64;
+const SESSION_TTL_SECS: u64 = 86_400;
+const SESSION_DISK_REFRESH_SECS: u64 = 3600;
+const SESSIONS_FILE: &str = "mcp_sessions.json";
 // 同时处理的连接数上限, 超出的连接直接关闭.
 const MAX_HTTP_CONNECTIONS: usize = 16;
-// HTTP 会话: Mcp-Session-Id → (协议状态, 最近使用时间).
-type HttpSessions = Arc<Mutex<HashMap<String, (Peer, Instant)>>>;
+// HTTP 会话: Mcp-Session-Id → (协议状态, 最近使用时间 Unix 秒).
+type HttpSessions = Arc<Mutex<HashMap<String, (Peer, u64)>>>;
 // 最近一次外部请求 (时间, 状态码, 是否带错误说明), 自检时据此判断 AI 客户端是否到达本服务及被拒原因.
 static LAST_REQUEST: Mutex<Option<(Instant, u16, bool)>> = Mutex::new(None);
-// 自检请求带此请求头, 不计入最近的外部请求.
+// 串行化 mcp_sessions.json 原子写入, 配合代次号防止停服清空后被迟到的阻塞写入写回旧会话.
+static SESSION_FILE_LOCK: Mutex<()> = Mutex::new(());
+static SESSION_SAVE_GEN: AtomicU64 = AtomicU64::new(0);
+// 自检请求带此请求头, 不计入最近的外部请求, 也不落盘会话.
 const SELF_CHECK_HEADER: &str = "x-hipshell-self-check";
 static TOOLS: LazyLock<Vec<Value>> = LazyLock::new(definitions);
+static TOOLS_SIGNATURE: LazyLock<String> = LazyLock::new(compute_tools_signature);
 
 const MAX_REQUEST: usize = 128 * 1024;
 // 初始化时交给 AI 的使用说明: 按类别介绍工具, 终端与独立执行由用户意图决定, 不预设偏好.
@@ -195,16 +207,130 @@ fn terminal_input(mut c_args: Value) -> Result<Value> {
     Ok(c_args)
 }
 
+#[derive(Serialize, Deserialize)]
+struct PersistedSessions {
+    signature: String,
+    sessions: Vec<PersistedSession>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedSession {
+    id: String,
+    client: String,
+    initialized: bool,
+    last_used_secs: u64,
+}
+
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |c| c.as_secs())
+}
+
+// 工具清单与使用说明的确定性指纹: 仅在工具或说明有实质变化时使持久化会话失效, 触发客户端重新初始化.
+fn compute_tools_signature() -> String {
+    let mut z_hash = 0xcbf2_9ce4_8422_2325u64;
+    let z_bytes = serde_json::to_vec(&*TOOLS).unwrap_or_default();
+    for l_byte in z_bytes.into_iter().chain(INSTRUCTIONS.bytes()) {
+        z_hash ^= u64::from(l_byte);
+        z_hash = z_hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{z_hash:016x}")
+}
+
+fn load_sessions(c_dir: &Path) -> HashMap<String, (Peer, u64)> {
+    let z_path = c_dir.join(SESSIONS_FILE);
+    let Ok(z_bytes) = crate::config::read_limited_bytes(&z_path) else {
+        return HashMap::new();
+    };
+    let Ok(z_saved) = serde_json::from_slice::<PersistedSessions>(&z_bytes) else {
+        return HashMap::new();
+    };
+    if z_saved.signature != *TOOLS_SIGNATURE {
+        return HashMap::new();
+    }
+    let z_now = unix_now_secs();
+    let mut z_map = HashMap::new();
+    for l_item in z_saved.sessions {
+        if l_item.id.is_empty()
+            || l_item.id.len() > 128
+            || z_now.saturating_sub(l_item.last_used_secs) >= SESSION_TTL_SECS
+        {
+            continue;
+        }
+        z_map.insert(
+            l_item.id,
+            (
+                Peer {
+                    negotiated: true,
+                    initialized: l_item.initialized,
+                    client: l_item.client.chars().filter(|c| !c.is_control()).take(13).collect(),
+                },
+                l_item.last_used_secs,
+            ),
+        );
+        if z_map.len() >= MAX_HTTP_SESSIONS {
+            break;
+        }
+    }
+    z_map
+}
+
+fn save_sessions_async(c_dir: PathBuf, c_sessions: &HttpSessions) {
+    let z_sessions = c_sessions.clone();
+    let z_gen = SESSION_SAVE_GEN.load(Ordering::Acquire);
+    tokio::task::spawn_blocking(move || {
+        let _l_guard = SESSION_FILE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        if SESSION_SAVE_GEN.load(Ordering::Acquire) != z_gen {
+            return;
+        }
+        // 在文件锁内读取最新快照, 避免并发写入线程乱序把旧快照覆盖到磁盘.
+        let z_items = {
+            let l_sessions = z_sessions.lock().unwrap_or_else(PoisonError::into_inner);
+            l_sessions
+                .iter()
+                .filter(|(_, (l_peer, _))| l_peer.negotiated)
+                .map(|(l_id, (l_peer, l_used))| PersistedSession {
+                    id: l_id.clone(),
+                    client: l_peer.client.clone(),
+                    initialized: l_peer.initialized,
+                    last_used_secs: *l_used,
+                })
+                .collect::<Vec<_>>()
+        };
+        let l_payload = PersistedSessions {
+            signature: TOOLS_SIGNATURE.clone(),
+            sessions: z_items,
+        };
+        if let Ok(l_bytes) = serde_json::to_vec(&l_payload) {
+            let _ = crate::config::write_bytes_atomic(&c_dir.join(SESSIONS_FILE), &l_bytes);
+        }
+    });
+}
+
+// 启停或切换端口时重置最近请求诊断记录, 避免旧状态污染自检结果.
+pub(crate) fn reset_diagnostics() {
+    *LAST_REQUEST.lock().unwrap_or_else(PoisonError::into_inner) = None;
+}
+
+// 用户主动关闭 MCP 服务时清理持久化会话, 下次重新开启从干净状态开始.
+pub(crate) fn clear_persisted_sessions(c_dir: &Path) {
+    let _l_guard = SESSION_FILE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    SESSION_SAVE_GEN.fetch_add(1, Ordering::AcqRel);
+    let _ = std::fs::remove_file(c_dir.join(SESSIONS_FILE));
+}
+
 // HTTP 方式 (Streamable HTTP): 主程序直接监听本机端口, AI 客户端按固定网址连接, 不需要桥接进程.
 // 不设令牌: 本机程序本就能读取配置目录, 令牌挡不住它们; 只接受本机地址, 并拒绝网页发起的请求.
-// 只回复普通 JSON, 不开服务器推送流; 会话表只在内存, 主程序重启后旧会话返回 404, 客户端按协议自动重新初始化.
-// 返回网址和监听任务; 中止该任务即关闭监听、释放端口 (Backend::apply_mcp 换端口或关闭时使用).
+// 只回复普通 JSON, 不开服务器推送流; 轻量持久化会话表使 HiPShell 重启后已有 AI 客户端无需重载即可续接,
+// 仅在工具清单变化、超过 24 小时或手动关闭 MCP 后返回 404 触发重新初始化.
+// 返回网址和监听任务; 中止该任务即关闭监听、释放端口 (Backend::apply_mcp / stop_mcp 使用).
 pub(crate) async fn start_http(c_backend: Arc<Backend>, c_port: u16) -> Result<(String, tokio::task::JoinHandle<()>)> {
     let z_listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, c_port))
         .await
         .with_context(|| format!("端口 {c_port} 被占用, 请换一个"))?;
     let z_url = format!("http://127.0.0.1:{c_port}/mcp");
-    let z_sessions: HttpSessions = Arc::new(Mutex::new(HashMap::new()));
+    let z_sessions: HttpSessions = Arc::new(Mutex::new(load_sessions(c_backend.data_dir())));
     let z_task = tokio::spawn(async move {
         // 连接任务归监听任务所有: 关闭服务或换端口中止监听任务时, 已接收、尚未执行完的请求一并取消.
         let mut z_connections = tokio::task::JoinSet::new();
@@ -234,7 +360,8 @@ async fn serve_http(c_stream: TcpStream, c_backend: &Arc<Backend>, c_sessions: &
     let (z_status, z_extra, z_body) = match tokio::time::timeout(Duration::from_secs(20), read_http(&mut z_reader)).await {
         Ok(Ok((l_method, l_path, l_headers, l_body))) => {
             let l_result = route_http(c_backend, c_sessions, &l_method, &l_path, &l_headers, &l_body).await;
-            if !l_headers.iter().any(|c| c.0 == SELF_CHECK_HEADER) {
+            // 自检与客户端主动注销 (DELETE) 不计入外部连接诊断状态.
+            if !l_headers.iter().any(|c| c.0 == SELF_CHECK_HEADER) && l_method != "DELETE" {
                 *LAST_REQUEST.lock().unwrap_or_else(PoisonError::into_inner) = Some((Instant::now(), l_result.0, !l_result.2.is_empty()));
             }
             l_result
@@ -287,11 +414,19 @@ async fn route_http(
         return (404, String::new(), Vec::new());
     }
     let z_session = z_header("mcp-session-id");
+    let z_self_check = z_header(SELF_CHECK_HEADER).is_some();
     match c_method {
         "POST" => {}
         "DELETE" => {
-            if let Some(l_id) = z_session {
-                c_sessions.lock().unwrap_or_else(PoisonError::into_inner).remove(l_id);
+            let z_removed = z_session.is_some_and(|l_id| {
+                c_sessions
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(l_id)
+                    .is_some()
+            });
+            if z_removed && !z_self_check {
+                save_sessions_async(c_backend.data_dir().to_path_buf(), c_sessions);
             }
             return (200, String::new(), Vec::new());
         }
@@ -333,25 +468,37 @@ async fn route_http(
     .await;
     // 参数无效的 initialize 不建立会话.
     if z_peer.negotiated {
+        let z_now = unix_now_secs();
+        let mut z_should_save = false;
         {
             let mut l_sessions = c_sessions.lock().unwrap_or_else(PoisonError::into_inner);
             if z_initialize {
                 // 不发 DELETE 就退出的客户端: 清掉一天未用的会话, 并限制总数.
-                l_sessions.retain(|_, c| c.1.elapsed() < Duration::from_secs(86400));
+                l_sessions.retain(|_, c| z_now.saturating_sub(c.1) < SESSION_TTL_SECS);
                 while l_sessions.len() >= MAX_HTTP_SESSIONS {
                     let Some(l_oldest) = l_sessions.iter().min_by_key(|c| c.1.1).map(|c| c.0.clone()) else { break; };
                     l_sessions.remove(&l_oldest);
                 }
             }
-            // 只有初始化新建会话; 其他请求只更新仍存在的会话, 期间被 DELETE 的会话不会被在途请求恢复.
+            // 只有初始化新建会话; 其他请求仅单调合并已存在的会话状态, 防止并发请求把 initialized 覆盖回 false,
+            // 期间被 DELETE 的会话也不会被在途请求恢复.
             if z_initialize {
-                l_sessions.insert(z_id.clone(), (z_peer.clone(), Instant::now()));
+                l_sessions.insert(z_id.clone(), (z_peer.clone(), z_now));
+                z_should_save = !z_self_check;
             } else if let Some(l_entry) = l_sessions.get_mut(&z_id) {
-                *l_entry = (z_peer.clone(), Instant::now());
+                let l_was_init = l_entry.0.initialized;
+                l_entry.0.negotiated |= z_peer.negotiated;
+                l_entry.0.initialized |= z_peer.initialized;
+                let l_refresh = z_now.saturating_sub(l_entry.1) >= SESSION_DISK_REFRESH_SECS;
+                l_entry.1 = z_now;
+                z_should_save = !z_self_check && ((!l_was_init && l_entry.0.initialized) || l_refresh);
             }
         }
+        if z_should_save {
+            save_sessions_async(c_backend.data_dir().to_path_buf(), c_sessions);
+        }
         // HTTP 没有常驻进程发心跳, 以最近的请求表示客户端在线; 自检不算客户端.
-        if z_header(SELF_CHECK_HEADER).is_none() {
+        if !z_self_check {
             let _ = c_backend.call("mcp_heartbeat", json!({"client_id":z_id,"name":z_peer.client}), Actor::Mcp).await;
         }
     }
@@ -419,11 +566,17 @@ fn local_host(c_host: &str) -> bool {
 // 返回 (级别 0 正常 / 1 需注意 / 2 服务不可用, 一句结论, 一句说明或处理办法).
 #[cfg(feature = "desktop")]
 pub(crate) async fn self_check(c_port: u16) -> (i32, String, String) {
-    let z_last = LAST_REQUEST.lock().unwrap_or_else(PoisonError::into_inner).clone();
-    match tokio::time::timeout(Duration::from_secs(5), check_initialize(c_port)).await {
+    // 入口一次性快照当前语言, 避免自检过程中切换语言产出中英混杂的标题与详情.
+    let z_en = crate::i18n::is_en();
+    let z_pick = |c_zh: &'static str, c_en: &'static str| if z_en { c_en } else { c_zh };
+    // 超过 5 分钟的历史异常请求不再阻塞自检结论, 避免偶发旧客户端错误永久污染控制面板诊断.
+    let z_last = (*LAST_REQUEST.lock().unwrap_or_else(PoisonError::into_inner)).filter(|(l_time, l_status, _)| {
+        matches!(l_status, 200 | 202 | 405) || l_time.elapsed() < Duration::from_secs(300)
+    });
+    match tokio::time::timeout(Duration::from_secs(5), check_initialize(c_port, z_en)).await {
         Ok(Ok(())) => {}
-        Ok(Err(err)) => return (2, "不可用".into(), err.to_string()),
-        Err(_) => return (2, "无响应".into(), "请关闭再打开 MCP 服务".into()),
+        Ok(Err(err)) => return (2, z_pick("不可用", "Unavailable").into(), err.to_string()),
+        Err(_) => return (2, z_pick("无响应", "No Response").into(), z_pick("请关闭再打开 MCP 服务", "Toggle MCP Server off and on again").into()),
     }
     let Some((z_time, z_status, z_detail)) = z_last else {
         // 只能看到本程序继承的环境变量; 客户端从终端启动时以终端里的为准.
@@ -432,56 +585,82 @@ pub(crate) async fn self_check(c_port: u16) -> (i32, String, String) {
             .any(|c| std::env::var(c).is_ok_and(|c| !c.is_empty()));
         let l_no_proxy = ["NO_PROXY", "no_proxy"].into_iter().filter_map(|c| std::env::var(c).ok()).collect::<String>();
         if l_proxy && !l_no_proxy.contains("127.0.0.1") {
-            return (1, "可能被代理拦截".into(), "把 127.0.0.1 加入 NO_PROXY, 再重启 AI 客户端".into());
+            return (
+                1,
+                z_pick("可能被代理拦截", "Blocked by Proxy").into(),
+                z_pick("把 127.0.0.1 加入 NO_PROXY, 再重启 AI 客户端", "Add 127.0.0.1 to NO_PROXY and restart your AI client").into(),
+            );
         }
-        return (0, "正常".into(), "还没有 AI 客户端连接过".into());
+        return (0, z_pick("正常", "OK").into(), z_pick("还没有 AI 客户端连接过", "No AI client has connected yet").into());
     };
     let z_ago = match z_time.elapsed().as_secs() {
-        0..60 => "刚刚".to_owned(),
-        l_seconds @ 60..3600 => format!("{} 分钟前", l_seconds / 60),
-        l_seconds => format!("{} 小时前", l_seconds / 3600),
+        0..60 => z_pick("刚刚", "just now").to_owned(),
+        l_seconds @ 60..3600 => if z_en { format!("{}m ago", l_seconds / 60) } else { format!("{} 分钟前", l_seconds / 60) },
+        l_seconds => if z_en { format!("{}h ago", l_seconds / 3600) } else { format!("{} 小时前", l_seconds / 3600) },
     };
     match z_status {
         // 405 是客户端探测推送流, 属正常.
-        200 | 202 | 405 => (0, "正常".into(), format!("AI 客户端{z_ago}连接成功")),
+        200 | 202 | 405 => (
+            0,
+            z_pick("正常", "OK").into(),
+            if z_en { format!("AI client connected {z_ago}") } else { format!("AI 客户端{z_ago}连接成功") },
+        ),
         // 带错误说明的 404 是会话表里没有该 Mcp-Session-Id, 不带的是路径不对.
-        404 if z_detail => (1, "会话失效".into(), "在 AI 客户端里重新加载 MCP".into()),
-        404 => (1, "网址有误".into(), format!("应为 http://127.0.0.1:{c_port}/mcp")),
-        403 => (1, "请求被拒".into(), "只接受本机请求".into()),
-        _ => (1, "请求异常".into(), format!("HTTP {z_status}, 客户端版本可能不兼容")),
+        404 if z_detail => (1, z_pick("会话失效", "Session Expired").into(), z_pick("在 AI 客户端里重新加载 MCP", "Reload MCP in your AI client").into()),
+        404 => (
+            1,
+            z_pick("网址有误", "Wrong URL").into(),
+            if z_en { format!("Expected http://127.0.0.1:{c_port}/mcp") } else { format!("应为 http://127.0.0.1:{c_port}/mcp") },
+        ),
+        403 => (1, z_pick("请求被拒", "Forbidden").into(), z_pick("只接受本机请求", "Localhost requests only").into()),
+        _ => (
+            1,
+            z_pick("请求异常", "Error").into(),
+            if z_en { format!("HTTP {z_status}; client may be incompatible") } else { format!("HTTP {z_status}, 客户端版本可能不兼容") },
+        ),
     }
 }
 
 #[cfg(feature = "desktop")]
-async fn check_initialize(c_port: u16) -> Result<()> {
-    let z_body = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"HiPShell 自检","version":env!("CARGO_PKG_VERSION")}}});
-    let z_reply = self_request(c_port, "POST", "", &z_body.to_string()).await?;
+async fn check_initialize(c_port: u16, c_en: bool) -> Result<()> {
+    let z_body = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"HiPShell Self-Check","version":env!("CARGO_PKG_VERSION")}}});
+    let z_reply = self_request(c_port, "POST", "", &z_body.to_string(), c_en).await?;
     let (z_head, z_payload) = z_reply.split_once("\r\n\r\n").unwrap_or((&z_reply, ""));
     let z_status = z_head.split(' ').nth(1).unwrap_or_default();
-    ensure!(z_status == "200", "端口 {c_port} 被其他程序占用, 请换一个");
+    let z_busy = || if c_en {
+        format!("Port {c_port} is in use by another app; pick another port")
+    } else {
+        format!("端口 {c_port} 被其他程序占用, 请换一个")
+    };
+    ensure!(z_status == "200", "{}", z_busy());
     let z_server = serde_json::from_str::<Value>(z_payload).ok().and_then(|c| c["result"]["serverInfo"]["name"].as_str().map(str::to_owned));
-    ensure!(z_server.as_deref() == Some("HiPShell"), "端口 {c_port} 被其他程序占用, 请换一个");
+    ensure!(z_server.as_deref() == Some("HiPShell"), "{}", z_busy());
     // 结束自检会话, 不占会话名额.
     let z_session = z_head.lines().find_map(|c| c.split_once(':').filter(|c| c.0.eq_ignore_ascii_case("mcp-session-id")).map(|c| c.1.trim().to_owned()));
     if let Some(l_id) = z_session {
-        let _ = self_request(c_port, "DELETE", &format!("Mcp-Session-Id: {l_id}\r\n"), "").await;
+        let _ = self_request(c_port, "DELETE", &format!("Mcp-Session-Id: {l_id}\r\n"), "", c_en).await;
     }
     Ok(())
 }
 
 // 向本机端口发一个请求并读完整回复 (服务端回复后即关闭连接).
 #[cfg(feature = "desktop")]
-async fn self_request(c_port: u16, c_method: &str, c_extra: &str, c_body: &str) -> Result<String> {
+async fn self_request(c_port: u16, c_method: &str, c_extra: &str, c_body: &str, c_en: bool) -> Result<String> {
     let mut z_stream = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, c_port))
         .await
-        .map_err(|_| anyhow::anyhow!("端口 {c_port} 未在监听, 请重开 MCP 服务"))?;
+        .map_err(|_| anyhow::anyhow!("{}", if c_en {
+            format!("Port {c_port} is not listening; toggle MCP Server")
+        } else {
+            format!("端口 {c_port} 未在监听, 请重开 MCP 服务")
+        }))?;
     let z_request = format!(
         "{c_method} /mcp HTTP/1.1\r\nHost: 127.0.0.1:{c_port}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\n{SELF_CHECK_HEADER}: 1\r\n{c_extra}Content-Length: {}\r\nConnection: close\r\n\r\n{c_body}",
         c_body.len()
     );
-    z_stream.write_all(z_request.as_bytes()).await.context("连接被中断, 请重开 MCP 服务")?;
+    let z_broken = if c_en { "Connection interrupted; toggle MCP Server" } else { "连接被中断, 请重开 MCP 服务" };
+    z_stream.write_all(z_request.as_bytes()).await.context(z_broken)?;
     let mut z_reply = Vec::new();
-    z_stream.read_to_end(&mut z_reply).await.context("连接被中断, 请重开 MCP 服务")?;
+    z_stream.read_to_end(&mut z_reply).await.context(z_broken)?;
     Ok(String::from_utf8_lossy(&z_reply).into_owned())
 }
 

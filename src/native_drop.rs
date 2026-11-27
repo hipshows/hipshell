@@ -143,7 +143,8 @@ pub(crate) fn install(c_ui: &AppWindow) {
                 }
                 if matches!(event.logical_key, winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape))
                     && z_weak.upgrade().is_some_and(|c| {
-                        if c.get_transfers_open() && !c.get_conflict_open() {
+                        // 仅在无其他模态弹窗时由 Esc 关闭传输面板, 避免拦截设置/连接编辑/删除等弹窗的 Esc.
+                        if c.get_transfers_open() && !c.get_modal_open() {
                             c.set_transfers_open(false);
                             true
                         } else {
@@ -173,16 +174,24 @@ pub(crate) fn install(c_ui: &AppWindow) {
         let Some(z_ui) = z_weak.upgrade() else {
             return EventResult::PreventDefault;
         };
-        let Some(z_position) = c_window.with_winit_window(drop_position).flatten() else {
-            z_ui.set_status("无法确定拖放位置, 请使用右键上传".into());
-            return EventResult::PreventDefault;
+        // 同一批多文件拖放 (1ms 合并窗口内) 复用首批已确认的落点, 避免松手瞬间移开鼠标截断后续文件.
+        let z_existing_pos = z_pending.borrow().as_ref().map(|c| c.position);
+        let z_position = match z_existing_pos {
+            Some(l_pos) => l_pos,
+            None => {
+                let Some(l_pos) = c_window.with_winit_window(drop_position).flatten() else {
+                    z_ui.invoke_notify(2, crate::i18n::t("无法确定拖放位置, 请使用右键上传", "Could not detect drop target; right-click to upload").into());
+                    return EventResult::PreventDefault;
+                };
+                if !z_ui.invoke_native_drop_target(l_pos.0, l_pos.1) {
+                    z_ui.invoke_notify(2, crate::i18n::t("请将文件拖入已连接的文件管理区域", "Drop files into the connected Files panel").into());
+                    return EventResult::PreventDefault;
+                }
+                l_pos
+            }
         };
-        if !z_ui.invoke_native_drop_target(z_position.0, z_position.1) {
-            z_ui.set_status("请将文件拖入已连接的文件管理区域".into());
-            return EventResult::PreventDefault;
-        }
         let z_cap = (z_ui.get_transfer_batch_limit().max(1) as usize) + 1;
-        let z_schedule = z_pending.borrow().is_none();
+        let z_schedule = z_existing_pos.is_none();
         {
             let mut z_pending = z_pending.borrow_mut();
             let z_batch = z_pending.get_or_insert_with(|| DropBatch {
@@ -210,7 +219,7 @@ pub(crate) fn install(c_ui: &AppWindow) {
                     || z_ui.get_browse_path().as_str() != z_batch.directory
                     || !z_ui.invoke_native_drop_target(z_batch.position.0, z_batch.position.1)
                 {
-                    z_ui.set_status("上传已取消, 目标目录或窗口状态已变化".into());
+                    z_ui.invoke_notify(2, crate::i18n::t("上传已取消, 目标目录或窗口状态已变化", "Upload cancelled: target folder or window state changed").into());
                     return;
                 }
                 let mut z_data = slint::DataTransfer::default();

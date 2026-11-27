@@ -16,7 +16,7 @@ pub(crate) const MAX_FILE_SIZE: u64 = 1024 * 1024;
 // 终端历史行数可选值; 每行约占 列数 x 32 字节, 1 万行 160 列约 50 MiB.
 pub const TERMINAL_SCROLLBACK_CHOICES: [u32; 4] = [1000, 2000, 5000, 10000];
 // 连接管理列表默认列宽 (逻辑像素): 主机、端口、用户、认证、代理.
-pub const CONNECTION_COLUMNS: [u32; 5] = [130, 50, 80, 48, 80];
+pub const CONNECTION_COLUMNS: [u32; 5] = [130, 50, 80, 68, 80];
 // 同时传输数 (所有服务器合计) 与单次选择/拖入的传输项数上限及默认值.
 pub const MAX_TRANSFER_CONCURRENCY: u32 = 16;
 pub const MAX_TRANSFER_BATCH: u32 = 2000;
@@ -31,6 +31,8 @@ struct HostKeys(HashMap<String, String>);
 #[serde(default)]
 pub struct AppSettings {
     pub dark_theme: bool,
+    // 界面语言: "zh" 中文 (默认), "en" 英文.
+    pub language: String,
     // 终端标签名前是否显示 [分组].
     pub tab_show_group: bool,
     // 下载目录; 空字符串表示用桌面.
@@ -86,6 +88,7 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             dark_theme: true,
+            language: "zh".into(),
             tab_show_group: true,
             download_dir: String::new(),
             connection_columns: CONNECTION_COLUMNS.to_vec(),
@@ -234,6 +237,16 @@ impl ConfigStore {
 
     pub fn set_dark_theme(&self, c_dark: bool) -> Result<()> {
         self.update_settings(|c| std::mem::replace(&mut c.dark_theme, c_dark) != c_dark)
+    }
+
+    pub fn set_language(&self, c_language: &str) -> Result<()> {
+        let z_language = c_language.to_ascii_lowercase();
+        ensure!(matches!(z_language.as_str(), "zh" | "en"), "不支持的语言设置");
+        self.update_settings(|c| {
+            let l_changed = c.language != z_language;
+            c.language = z_language;
+            l_changed
+        })
     }
 
     pub fn set_tab_show_group(&self, c_show: bool) -> Result<()> {
@@ -899,6 +912,7 @@ fn normalize_settings(c_settings: &mut AppSettings) {
         .recent_connections
         .retain(|c_id| uuid::Uuid::parse_str(c_id).is_ok() && z_seen.insert(c_id.clone()));
     c_settings.recent_connections.truncate(20);
+    c_settings.language = crate::i18n::code(crate::i18n::from_code(&c_settings.language)).into();
     if !TERMINAL_SCROLLBACK_CHOICES.contains(&c_settings.terminal_scrollback) {
         c_settings.terminal_scrollback = DEFAULT_TERMINAL_SCROLLBACK;
     }

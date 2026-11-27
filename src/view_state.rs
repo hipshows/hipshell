@@ -28,11 +28,18 @@ impl SessionViews {
         c_ui.set_active_session_empty(z_row.as_ref().is_none_or(|c| c.empty));
         c_ui.set_active_connected(z_row.as_ref().is_some_and(|c| c.connected));
         c_ui.set_active_state(z_row.as_ref().map(|c| c.state).unwrap_or(0));
-        // 连接 ID 与失败原因随下一次状态刷新填入, 切换时先清空, 避免"编辑连接"指向上一个标签.
+        // 连接 ID、失败原因与监控标题随下一次状态刷新填入, 切换时先清空, 避免"编辑连接"、连接中遮罩或侧栏残留上一个标签.
         c_ui.set_active_connection_id(SharedString::default());
         c_ui.set_active_error(SharedString::default());
+        c_ui.set_active_error_detail(SharedString::default());
         c_ui.set_active_dropped(false);
         c_ui.set_active_latency_ms(-1);
+        c_ui.set_peer_status(
+            if z_row.as_ref().is_some_and(|c| c.empty) { crate::i18n::t("快速连接", "Quick Connect") } else { "" }.into(),
+        );
+        c_ui.set_monitor_server_name(SharedString::default());
+        c_ui.set_monitor_server_host(SharedString::default());
+        c_ui.set_monitor_text(crate::i18n::t("尚未连接", "Not connected").into());
         c_ui.set_selected_terminal_text(SharedString::default());
         c_ui.set_selection_spans(ModelRc::default());
         c_ui.set_selection_dragging(false);
@@ -176,11 +183,19 @@ impl SessionView {
         c_ui.set_mouse_mode(self.mouse_mode);
         c_ui.set_mouse_tracking(self.mouse_tracking);
         c_ui.set_terminal_runs(self.terminal_runs.clone());
-        c_ui.set_files(self.files.clone());
+        c_ui.set_files(if self.files.row_count() > 0 {
+            ModelRc::new(slint::VecModel::from(crate::ui::localize_file_rows(self.files.iter())))
+        } else {
+            self.files.clone()
+        });
         c_ui.set_directory_tree(self.directory_tree.clone());
         c_ui.set_browse_path(self.browse_path.clone());
         c_ui.set_remote_listed_session(self.remote_listed_session.clone());
-        c_ui.set_file_time_label(if self.file_time_label.is_empty() { "修改时间".into() } else { self.file_time_label.clone() });
+        c_ui.set_file_time_label(if self.file_time_label.is_empty() {
+            crate::i18n::t("修改时间", "Modified").into()
+        } else {
+            crate::ui::localize_file_time_label(self.file_time_label.as_str()).into()
+        });
         c_ui.set_remote_ready(self.remote_ready);
         c_ui.set_selected_remote(self.selected_remote.clone());
         c_ui.set_selected_files_count(self.selected_files_count);
